@@ -15,20 +15,17 @@ from langchain.chains import RetrievalQA
 ROOT_DIR = os.path.dirname(__file__) or os.getcwd()
 CHROMA_DB_PATH = os.path.join(ROOT_DIR, "chroma_db")
 DOCUMENTS_DIR = os.path.join(ROOT_DIR, "documents")
-KNOWLEDGE_FILE_PATH = os.path.join(DOCUMENTS_DIR, "Dataset.csv")  # your uploaded 5k CSV
+KNOWLEDGE_FILE_PATH = os.path.join(DOCUMENTS_DIR, "ai_cybersecurity_dataset-sampled-5k.csv")
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
-# RAG models
 PRIMARY_REPO_ID = "mistralai/Mixtral-8x7B-Instruct-v0.1"
 FALLBACK_SMALL_REPO_ID = "google/flan-t5-small"
 
-# ---------- Globals ----------
 ml_models = {}
 
-# ---------- Utilities ----------
-def load_csv_and_sample():
-    """Load the 5k CSV (already uploaded) and verify columns"""
+def load_csv():
+    """Load the 5k sampled cybersecurity CSV"""
     if not os.path.exists(KNOWLEDGE_FILE_PATH):
         print(f"Knowledge CSV not found: {KNOWLEDGE_FILE_PATH}")
         return None
@@ -42,117 +39,81 @@ def load_csv_and_sample():
         traceback.print_exc()
         return None
 
-# ---------- FastAPI lifespan ----------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("LIFESPAN: starting up textgen service...")
+    print("Starting up textgen service...")
 
-    # 1) initialize embedding function
+    # 1) Initialize embedding
     try:
         emb_fn = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL_NAME)
         ml_models["embedding_function"] = emb_fn
-        print("LIFESPAN: embedding function initialized.")
     except Exception:
-        print("LIFESPAN: failed to initialize embeddings.")
         traceback.print_exc()
         ml_models["embedding_function"] = None
 
-    # 2) initialize Chroma persistent client
+    # 2) Initialize Chroma vector store
     try:
         os.makedirs(CHROMA_DB_PATH, exist_ok=True)
         client = Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=ml_models["embedding_function"])
-        ml_models["db_client"] = client
         ml_models["vector_store"] = client
-        print("LIFESPAN: Persistent Chroma initialized.")
     except Exception:
-        print("LIFESPAN: Chroma initialization failed, fallback to in-memory.")
         traceback.print_exc()
         try:
             client = Chroma(embedding_function=ml_models["embedding_function"])
-            ml_models["db_client"] = client
             ml_models["vector_store"] = client
-            print("LIFESPAN: In-memory Chroma initialized.")
         except Exception:
-            print("LIFESPAN: Chroma fallback also failed.")
             traceback.print_exc()
             ml_models["vector_store"] = None
 
-    # 3) ingest CSV into vector store if empty
+    # 3) Ingest CSV if empty
     vs = ml_models.get("vector_store")
-    if vs is not None:
+    if vs:
         try:
-            if len(vs._collection.get(include=['documents'])['documents']) == 0:
-                df = load_csv_and_sample()
+            docs_in_store = vs._collection.get(include=['documents'])['documents']
+            if len(docs_in_store) == 0:
+                df = load_csv()
                 if df is not None:
-                    required_cols = ['Dst Port', 'Protocol', 'Flow Duration', 'Tot Fwd Pkts', 'Tot Bwd Pkts', 'Label']
-                    if all(c in df.columns for c in required_cols):
-                        docs = df.apply(
-                            lambda r: (
-                                f"A network traffic event. DstPort: {r['Dst Port']}. Protocol: {r['Protocol']}. "
-                                f"FlowDuration: {r['Flow Duration']}. TotFwdPkts: {r['Tot Fwd Pkts']}. "
-                                f"TotBwdPkts: {r['Tot Bwd Pkts']}. Label: {r['Label']}."
-                            ),
-                            axis=1
-                        ).tolist()
-                        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-                        chunks = splitter.split_text("\n\n".join(docs))
-                        vs.add_texts(texts=chunks)
-                        vs.persist()
-                        print(f"LIFESPAN: ingested {len(docs)} docs -> {len(chunks)} chunks.")
-                    else:
-                        print("LIFESPAN: CSV missing required columns; skipping ingestion.")
-                else:
-                    print("LIFESPAN: CSV not loaded; skipping ingestion.")
-            else:
-                print("LIFESPAN: vector store already has data; skipping ingestion.")
+                    # Convert each row to a simple string representation
+                    docs = df.apply(lambda r: " | ".join([f"{c}: {r[c]}" for c in df.columns]), axis=1).tolist()
+                    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+                    chunks = splitter.split_text("\n\n".join(docs))
+                    vs.add_texts(texts=chunks)
+                    vs.persist()
+                    print(f"Ingested {len(docs)} docs -> {len(chunks)} chunks.")
         except Exception:
-            print("LIFESPAN: vector store ingestion failed.")
             traceback.print_exc()
 
-    # 4) initialize RAG chain
+    # 4) Initialize RAG chain
     ml_models["rag_chain"] = None
-    if not HF_TOKEN:
-        print("LIFESPAN: HUGGINGFACEHUB_API_TOKEN not set; RAG chain unavailable.")
-    else:
-        if vs is None:
-            print("LIFESPAN: vector store unavailable; cannot init RAG chain.")
-        else:
-            def try_create_llm(repo_id, task_type):
-                try:
-                    print(f"LIFESPAN: creating LLM for {repo_id} with task {task_type}")
-                    llm = HuggingFaceHub(
-                        repo_id=repo_id,
-                        task=task_type,
-                        huggingfacehub_api_token=HF_TOKEN,
-                        model_kwargs={"temperature": 0.5, "max_new_tokens": 1024}
-                    )
-                    rag = RetrievalQA.from_chain_type(
-                        llm=llm,
-                        chain_type="stuff",
-                        retriever=vs.as_retriever()
-                    )
-                    print(f"LIFESPAN: LLM {repo_id} initialized successfully.")
-                    return rag
-                except Exception as e:
-                    print(f"LIFESPAN: Failed LLM {repo_id}: {e}")
-                    traceback.print_exc()
-                    return None
+    if HF_TOKEN and vs:
+        def try_create_llm(repo_id, task_type):
+            try:
+                llm = HuggingFaceHub(
+                    repo_id=repo_id,
+                    task=task_type,
+                    huggingfacehub_api_token=HF_TOKEN,
+                    model_kwargs={"temperature": 0.5, "max_new_tokens": 1024}
+                )
+                rag = RetrievalQA.from_chain_type(
+                    llm=llm,
+                    chain_type="stuff",
+                    retriever=vs.as_retriever()
+                )
+                return rag
+            except Exception:
+                traceback.print_exc()
+                return None
 
-            rag = try_create_llm(PRIMARY_REPO_ID, task_type="text-generation")
-            if rag is None:
-                rag = try_create_llm(FALLBACK_SMALL_REPO_ID, task_type="text2text-generation")
-            ml_models["rag_chain"] = rag
+        rag = try_create_llm(PRIMARY_REPO_ID, task_type="text-generation")
+        if rag is None:
+            rag = try_create_llm(FALLBACK_SMALL_REPO_ID, task_type="text2text-generation")
+        ml_models["rag_chain"] = rag
 
-    print("LIFESPAN: startup complete. Status:", {
-        "vector_store_ready": bool(vs),
-        "rag_chain_ready": bool(ml_models.get("rag_chain")),
-        "hf_token_set": bool(HF_TOKEN),
-    })
+    print("Startup complete.")
     yield
     ml_models.clear()
-    print("LIFESPAN: shutdown complete.")
+    print("Shutdown complete.")
 
-# ---------- FastAPI app ----------
 app = FastAPI(lifespan=lifespan)
 
 class QueryRequest(BaseModel):
@@ -163,7 +124,7 @@ class QueryResponse(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "Text Generation (RAG) Service is running."}
+    return {"status": "Text Generation (RAG) Service running."}
 
 @app.get("/status")
 def status():
@@ -176,13 +137,12 @@ def status():
 @app.post("/generate-text", response_model=QueryResponse)
 async def generate_text(req: QueryRequest):
     if not ml_models.get("rag_chain"):
-        raise HTTPException(status_code=503, detail="RAG chain is not available.")
+        raise HTTPException(status_code=503, detail="RAG chain not available.")
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
     try:
         out = ml_models["rag_chain"].run(req.query)
         return QueryResponse(answer=str(out) if out is not None else "No answer generated.")
     except Exception as e:
-        print("Generation error:")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
