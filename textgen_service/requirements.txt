@@ -1,9 +1,10 @@
 fastapi
 uvicorn
+pydantic
+langchain==0.1.20
+langchain-community==0.0.38
+sentence-transformers==2.7.0
+chromadb==0.5.0
+huggingface-hub==0.23.0
 pandas
 requests
-langchain
-langchain-community
-chromadb
-sentence-transformers
-huggingface_hub
