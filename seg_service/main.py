@@ -26,7 +26,6 @@ except ImportError:
     build_sam2 = None
     SAM2ImagePredictor = None
 
-
 # -------------------------------
 # Text-Driven Segmenter Class
 # -------------------------------
@@ -42,13 +41,11 @@ class TextDrivenSegmenter:
         sam2_checkpoint = "checkpoints/sam2.1_hiera_large.pt"
         print("🔄 Initializing SAM2...")
         try:
-            # Clear previous hydra config
             if hydra.core.global_hydra.GlobalHydra.instance().is_initialized():
                 hydra.core.global_hydra.GlobalHydra.instance().clear()
             config_dir = os.path.abspath("segment-anything-2/sam2/configs")
             if not os.path.isdir(config_dir):
                 raise FileNotFoundError(f"SAM2 config directory not found: {config_dir}")
-            
             initialize_config_dir(config_dir=config_dir, version_base=None)
             config_name = "sam2.1/sam2.1_hiera_l"
             sam2_model = build_sam2(config_name, sam2_checkpoint, device=self.device)
@@ -82,7 +79,7 @@ class TextDrivenSegmenter:
     def process_image(self, image_input: Image.Image, text_prompt: str, clip_threshold=0.5):
         img = image_input.convert("RGB")
         prompts = [p.strip() for p in text_prompt.split('.')]
-        inputs = self.clip_processor(text=prompts, images=[img]*len(prompts), padding="max_length", return_tensors="pt").to(self.device)
+        inputs = self.clip_processor(text=prompts, images=[img] * len(prompts), padding="max_length", return_tensors="pt").to(self.device)
         
         with torch.no_grad():
             outputs = self.clip_model(**inputs)
@@ -111,7 +108,6 @@ class TextDrivenSegmenter:
         if not all_masks: return None
         return {"image": img_np, "masks": np.array(all_masks)}
 
-
 # -------------------------------
 # FastAPI Setup
 # -------------------------------
@@ -132,7 +128,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-
 def apply_masks_and_visualize(image_np, masks):
     overlay = image_np.copy()
     for mask in masks:
@@ -142,34 +137,27 @@ def apply_masks_and_visualize(image_np, masks):
         overlay = cv2.addWeighted(overlay, 1, colored_mask, 0.6, 0)
     return overlay
 
-
 @app.get("/")
 def read_root():
     return {"status": "Text-based Image Segmentation Service is running."}
-
 
 @app.post("/segment-image/")
 async def segment_image(prompt: str = Form(...), image: UploadFile = File(...)):
     if "segmenter" not in ml_models:
         raise HTTPException(status_code=503, detail="Segmentation model not loaded.")
-
     if not image.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="Provided file is not an image.")
-
     try:
         contents = await image.read()
         pil_image = Image.open(io.BytesIO(contents))
         results = ml_models["segmenter"].process_image(pil_image, prompt)
-
         if results is None:
             raise HTTPException(status_code=404, detail="No object detected for given prompt.")
-
         final_image_np = apply_masks_and_visualize(results["image"], results["masks"])
         final_image_pil = Image.fromarray(final_image_np)
         img_byte_arr = io.BytesIO()
         final_image_pil.save(img_byte_arr, format='PNG')
         img_byte_arr.seek(0)
-
         return StreamingResponse(img_byte_arr, media_type="image/png")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Segmentation error: {str(e)}")
