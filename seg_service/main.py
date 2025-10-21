@@ -127,17 +127,18 @@ class TextDrivenSegmenter:
                 print(f"⚠️ No object found by CLIPSeg for prompt: '{prompts[i]}'")
                 continue
 
-            for contour in contours:
-                x, y, w, h = cv2.boundingRect(contour)
-                sam_box_prompt = np.array([x, y, x + w, y + h])
-                refined_masks, scores, _ = self.sam2_predictor.predict(
-                    box=sam_box_prompt,
-                    multimask_output=False
-                )
-                all_masks.append(refined_masks[0])
-                all_scores.append(scores[0])
-                final_boxes.append(sam_box_prompt)
-                final_phrases.append(prompts[i])
+            largest_contour = max(contours, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(largest_contour)
+            sam_box_prompt = np.array([x, y, x + w, y + h])
+
+            refined_masks, scores, _ = self.sam2_predictor.predict(
+                box=sam_box_prompt,
+                multimask_output=False
+            )
+            all_masks.append(refined_masks[0])
+            all_scores.append(scores[0])
+            final_boxes.append(sam_box_prompt)
+            final_phrases.append(prompts[i])
 
         if not all_masks:
             print("⚠️ Mask generation failed for all prompts.")
@@ -175,37 +176,70 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # -------------------------------
-# Helper functions
+# Helper functions for Visualization
 # -------------------------------
-def visualize_boxes_and_masks(image_np, masks, boxes, phrases):
-    """
-    Applies colored masks, bounding boxes, and labels to the image.
-    This function combines all visualization elements into a single image.
-    """
+def draw_boxes(image_np, boxes, phrases):
+    """Draws only the bounding boxes and labels on an image."""
     overlay = image_np.copy()
-    # 1. Draw masks
+    for box, phrase in zip(boxes, phrases):
+        x0, y0, x1, y1 = box
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 255, 0), 2)
+        text_size, _ = cv2.getTextSize(phrase, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        text_w, text_h = text_size
+        cv2.rectangle(overlay, (x0, y0 - text_h - 5), (x0 + text_w, y0 - 5), (0, 255, 0), -1)
+        cv2.putText(overlay, phrase, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+    return overlay
+
+def draw_masks_and_boxes(image_np, masks, boxes, phrases):
+    """Draws masks, bounding boxes, and labels on an image."""
+    overlay = image_np.copy()
     for mask in masks:
         color = np.random.randint(50, 256, 3)
         colored_mask = np.zeros_like(overlay)
         colored_mask[mask > 0] = color
-        overlay = cv2.addWeighted(overlay, 1, colored_mask, 0.5, 0) # Use 0.5 alpha for transparency
-
-    # 2. Draw boxes and labels
-    for box, phrase in zip(boxes, phrases):
-        x0, y0, x1, y1 = box
-        # Draw the bounding box
-        cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 255, 0), 2) # Green box, 2px thick
-
-        # Prepare text and its background
-        text_size, _ = cv2.getTextSize(phrase, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-        text_w, text_h = text_size
-        # Place background rectangle
-        cv2.rectangle(overlay, (x0, y0 - text_h - 5), (x0 + text_w, y0 - 5), (0, 255, 0), -1) # Green background
-        # Place text
-        cv2.putText(overlay, phrase, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2) # Black text
-
+        overlay = cv2.addWeighted(overlay, 1, colored_mask, 0.5, 0)
+    # Draw boxes on top of masks
+    overlay = draw_boxes(overlay, boxes, phrases)
     return overlay
 
+def create_comparison_visualization(results):
+    """Creates a 3-panel comparison image: Original, Bounding Boxes, and Final Masks."""
+    image_np = results["image"]
+    masks = results["masks"]
+    boxes = results["boxes"]
+    phrases = results["phrases"]
+
+    # 1. Create each panel
+    panel1 = image_np.copy()
+    panel2 = draw_boxes(image_np, boxes, phrases)
+    panel3 = draw_masks_and_boxes(image_np, masks, boxes, phrases)
+
+    # 2. Add titles to each panel
+    h, w, _ = image_np.shape
+    header_height = 50
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 1
+    font_thickness = 2
+    
+    panels = [panel1, panel2, panel3]
+    titles = ["1. Original Image", "2. Region Seeds (from CLIPSeg)", "3. Final Refined Masks (by SAM2)"]
+    titled_panels = []
+
+    for i, panel in enumerate(panels):
+        # Create a new image with space for the header
+        new_panel = np.ones((h + header_height, w, 3), dtype=np.uint8) * 255
+        new_panel[header_height:h + header_height, :] = panel
+        
+        # Add the title text
+        text_size, _ = cv2.getTextSize(titles[i], font, font_scale, font_thickness)
+        text_x = (w - text_size[0]) // 2
+        text_y = (header_height + text_size[1]) // 2
+        cv2.putText(new_panel, titles[i], (text_x, text_y), font, font_scale, (0, 0, 0), font_thickness, cv2.LINE_AA)
+        titled_panels.append(new_panel)
+
+    # 3. Combine the panels horizontally
+    comparison_image = np.hstack(titled_panels)
+    return comparison_image
 
 # -------------------------------
 # Routes
@@ -229,13 +263,8 @@ async def segment_image(prompt: str = Form(...), image: UploadFile = File(...)):
         if results is None:
             raise HTTPException(status_code=404, detail="No object detected for the given prompt.")
 
-        # --- UPDATED: Use the new combined visualization function ---
-        final_image_np = visualize_boxes_and_masks(
-            results["image"],
-            results["masks"],
-            results["boxes"],
-            results["phrases"]
-        )
+        # --- UPDATED: Use the new 3-panel comparison visualization ---
+        final_image_np = create_comparison_visualization(results)
         final_image_pil = Image.fromarray(final_image_np)
 
         img_byte_arr = io.BytesIO()
