@@ -4,7 +4,7 @@ import io
 import cv2
 import torch
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
@@ -89,24 +89,18 @@ class TextDrivenSegmenter:
             print("✅ SAM2 checkpoint already exists.")
 
     def process_image(self, image_input: Image.Image, text_prompt: str, clip_threshold=0.5):
-        """
-        Processes an image with a text prompt to generate segmentation masks.
-        This logic is now identical to your original working script.
-        """
         img = image_input.convert("RGB")
         prompts = [p.strip() for p in text_prompt.split('.') if p.strip()]
         if not prompts:
             print("⚠️ No valid prompts found in the input text.")
             return None
 
-        # --- Step 1: Get rough masks from CLIPSeg ---
         inputs = self.clip_processor(
             text=prompts,
             images=[img] * len(prompts),
             padding="max_length",
             return_tensors="pt"
         )
-        # Move tensors to the correct device
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
@@ -119,7 +113,6 @@ class TextDrivenSegmenter:
         all_masks, all_scores, final_boxes, final_phrases = [], [], [], []
 
         for i, heatmap in enumerate(heatmaps):
-            # --- Step 2: Create a reliable prompt from the rough mask ---
             heatmap_resized = torch.nn.functional.interpolate(
                 heatmap.unsqueeze(0).unsqueeze(0),
                 size=(img.height, img.width),
@@ -134,21 +127,17 @@ class TextDrivenSegmenter:
                 print(f"⚠️ No object found by CLIPSeg for prompt: '{prompts[i]}'")
                 continue
 
-            # Find the largest contour and get its bounding box
-            largest_contour = max(contours, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(largest_contour)
-            sam_box_prompt = np.array([x, y, x + w, y + h])
-
-            # --- Step 3: Refine the mask with SAM2 ---
-            refined_masks, scores, _ = self.sam2_predictor.predict(
-                box=sam_box_prompt,
-                multimask_output=False
-            )
-
-            all_masks.append(refined_masks[0])
-            all_scores.append(scores[0])
-            final_boxes.append(sam_box_prompt)
-            final_phrases.append(prompts[i])
+            for contour in contours:
+                x, y, w, h = cv2.boundingRect(contour)
+                sam_box_prompt = np.array([x, y, x + w, y + h])
+                refined_masks, scores, _ = self.sam2_predictor.predict(
+                    box=sam_box_prompt,
+                    multimask_output=False
+                )
+                all_masks.append(refined_masks[0])
+                all_scores.append(scores[0])
+                final_boxes.append(sam_box_prompt)
+                final_phrases.append(prompts[i])
 
         if not all_masks:
             print("⚠️ Mask generation failed for all prompts.")
@@ -178,7 +167,6 @@ async def lifespan(app: FastAPI):
     except Exception:
         print("❌ Failed to load segmentation models:")
         traceback.print_exc()
-        # This will prevent the service from starting if models fail to load
         raise RuntimeError("Segmentation service failed to start.")
     yield
     ml_models.clear()
@@ -189,16 +177,35 @@ app = FastAPI(lifespan=lifespan)
 # -------------------------------
 # Helper functions
 # -------------------------------
-def apply_masks_and_visualize(image_np, masks):
-    """Applies colored overlays for each mask onto the original image."""
+def visualize_boxes_and_masks(image_np, masks, boxes, phrases):
+    """
+    Applies colored masks, bounding boxes, and labels to the image.
+    This function combines all visualization elements into a single image.
+    """
     overlay = image_np.copy()
+    # 1. Draw masks
     for mask in masks:
-        # Generate a random color for each mask
-        color = np.random.randint(50, 256, 3) # Use a wider range for more distinct colors
+        color = np.random.randint(50, 256, 3)
         colored_mask = np.zeros_like(overlay)
         colored_mask[mask > 0] = color
-        overlay = cv2.addWeighted(overlay, 1, colored_mask, 0.6, 0)
+        overlay = cv2.addWeighted(overlay, 1, colored_mask, 0.5, 0) # Use 0.5 alpha for transparency
+
+    # 2. Draw boxes and labels
+    for box, phrase in zip(boxes, phrases):
+        x0, y0, x1, y1 = box
+        # Draw the bounding box
+        cv2.rectangle(overlay, (x0, y0), (x1, y1), (0, 255, 0), 2) # Green box, 2px thick
+
+        # Prepare text and its background
+        text_size, _ = cv2.getTextSize(phrase, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        text_w, text_h = text_size
+        # Place background rectangle
+        cv2.rectangle(overlay, (x0, y0 - text_h - 5), (x0 + text_w, y0 - 5), (0, 255, 0), -1) # Green background
+        # Place text
+        cv2.putText(overlay, phrase, (x0, y0 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2) # Black text
+
     return overlay
+
 
 # -------------------------------
 # Routes
@@ -222,7 +229,13 @@ async def segment_image(prompt: str = Form(...), image: UploadFile = File(...)):
         if results is None:
             raise HTTPException(status_code=404, detail="No object detected for the given prompt.")
 
-        final_image_np = apply_masks_and_visualize(results["image"], results["masks"])
+        # --- UPDATED: Use the new combined visualization function ---
+        final_image_np = visualize_boxes_and_masks(
+            results["image"],
+            results["masks"],
+            results["boxes"],
+            results["phrases"]
+        )
         final_image_pil = Image.fromarray(final_image_np)
 
         img_byte_arr = io.BytesIO()
@@ -234,3 +247,4 @@ async def segment_image(prompt: str = Form(...), image: UploadFile = File(...)):
         print(f"❌ An error occurred during segmentation: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Segmentation error: {str(e)}")
+
