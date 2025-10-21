@@ -1,3 +1,4 @@
+# sentiment_service/main.py
 import os
 import re
 import unicodedata
@@ -76,12 +77,10 @@ ml_models = {}
 async def lifespan(app: FastAPI):
     print("🚀 Starting up Sentiment service...")
     model_path = "./model"  # local model folder (if present)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    desired_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     try:
-        # Preprocessor always available
         ml_models["preprocessor"] = DistilBERTPreprocessor(model_case='uncased')
 
-        # Load tokenizer & model from local folder if available; otherwise fallback to HF SST-2 finetuned model
         if os.path.exists(model_path) and os.listdir(model_path):
             print(f"Loading local model from {model_path} ...")
             ml_models["tokenizer"] = AutoTokenizer.from_pretrained(model_path)
@@ -91,22 +90,27 @@ async def lifespan(app: FastAPI):
             ml_models["tokenizer"] = AutoTokenizer.from_pretrained("distilbert-base-uncased-finetuned-sst-2-english")
             ml_models["model"] = AutoModelForSequenceClassification.from_pretrained("distilbert-base-uncased-finetuned-sst-2-english")
 
-        ml_models["device"] = device
-        # move to device (may be CPU)
+        # Try to move model to desired device, otherwise fall back to CPU
         try:
-            ml_models["model"].to(device)
+            ml_models["model"].to(desired_device)
+            ml_models["device"] = desired_device
         except Exception as e:
-            # Log but don't crash — model may be on meta device in some edge cases
-            print(f"Warning: moving model to device failed: {e}")
+            print(f"Warning: moving model to {desired_device} failed: {e}. Falling back to CPU.")
+            ml_models["device"] = torch.device("cpu")
+            try:
+                ml_models["model"].to(ml_models["device"])
+            except Exception as e2:
+                print(f"Warning: moving model to CPU also failed: {e2}. The model may be on meta device and unusable.")
 
         ml_models["model"].eval()
-        print(f"✅ Models loaded successfully on device: {ml_models['device']}")
+        print(f"✅ Models loaded (device={ml_models.get('device')}).")
     except Exception as e:
         print(f"❌ Error loading models: {e}")
     yield
     ml_models.clear()
     print("✅ Sentiment service shutdown complete.")
 
+# attach lifespan to FastAPI
 app = FastAPI(lifespan=lifespan)
 
 # -------------------------
@@ -144,14 +148,14 @@ def _predict_from_text(text: str):
     pred_id = int(np.argmax(probs))
     confidence = float(probs[pred_id])
 
-    # map id->label using model config if available
+    # map id->label using model config if available, otherwise use defaults
     id2label = getattr(model.config, "id2label", None)
     if id2label:
         label = id2label.get(pred_id, str(pred_id))
     else:
-        label = str(pred_id)
+        label = "POSITIVE" if pred_id == 1 else "NEGATIVE" if pred_id == 0 else str(pred_id)
 
-    prob_dict = {id2label.get(i, str(i)): float(p) for i, p in enumerate(probs)} if id2label else {str(i): float(p) for i, p in enumerate(probs)}
+    prob_dict = {id2label.get(i, str(i)): float(p) for i, p in enumerate(probs)} if id2label else {("POSITIVE" if i==1 else "NEGATIVE" if i==0 else str(i)): float(p) for i,p in enumerate(probs)}
     return label, confidence, prob_dict
 
 # -------------------------
@@ -181,7 +185,6 @@ async def predict_compat(request: SentimentRequest):
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
     try:
         label, confidence, probs = _predict_from_text(request.text)
-        # older frontends expect "sentiment" and "score"
         return {"sentiment": label, "score": confidence, "probabilities": probs}
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
