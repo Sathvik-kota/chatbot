@@ -1,4 +1,10 @@
 fastapi
 uvicorn
-transformers
 torch
+transformers
+pandas
+numpy
+emoji
+contractions
+python-multipart
+scikit-learn
