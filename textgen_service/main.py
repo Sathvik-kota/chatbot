@@ -9,8 +9,9 @@ from contextlib import asynccontextmanager
 
 # Core imports
 from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
-# <-- updated import: langchain_text_splitters is now a separate package
+# updated import: langchain_text_splitters is now a separate package
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+# keep RetrievalQA import (works with pinned langchain version)
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
@@ -23,12 +24,9 @@ from langchain_community.vectorstores import Chroma
 
 # HuggingFace LLM access
 try:
-    # If you installed the newer "langchain-huggingface" / HuggingFaceEndpoint wrapper
-    # (this import will succeed when that package is available)
     from langchain_huggingface import HuggingFaceEndpoint
     USE_NEW_API = True
 except Exception:
-    # Fallback to the community wrapper that wraps HF Hub endpoints
     from langchain_community.llms import HuggingFaceHub
     USE_NEW_API = False
 
