@@ -1,6 +1,6 @@
 """
-Robust RAG service with LOCAL MODEL support - FINAL FIXED VERSION
-Handles both detailed explanations AND listing/aggregation queries correctly
+Robust RAG service with LOCAL MODEL support - HYBRID VERSION
+Handles BOTH context-grounded answers AND general knowledge fallback
 """
 import os
 import traceback
@@ -62,10 +62,9 @@ DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
-# Use a SMALL local model that works well for Q&A
-LOCAL_MODEL_ID = "google/flan-t5-base"  # Using base for better quality
+LOCAL_MODEL_ID = "google/flan-t5-base"
 
-TOP_K = 10  # *** INCREASED: Retrieve more documents for listing/aggregation queries ***
+TOP_K = 10  # Retrieve more documents for better coverage
 
 # ---------------- Globals ----------------
 ml_models = {
@@ -198,13 +197,10 @@ def _try_add_texts(vs, texts):
     return False, None
 
 def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
-    """
-    Creates CLEAN, MEANINGFUL documents from ONLY the relevant columns
-    """
+    """Creates CLEAN documents from relevant columns"""
     if df is None or vs is None:
         return False, "no_df_or_vs"
 
-    # Use ONLY meaningful text columns
     USEFUL_COLUMNS = [
         "Attack Type",
         "Attack Severity", 
@@ -216,13 +212,12 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
     cols_to_use = [df_cols_lower[col_name.lower()] for col_name in USEFUL_COLUMNS if col_name.lower() in df_cols_lower]
 
     if not cols_to_use:
-        print("[INGEST] ERROR: Could not find expected columns (Attack Type, Attack Severity, etc.)")
+        print("[INGEST] ERROR: Could not find expected columns")
         print(f"[INGEST] Available columns: {list(df.columns)}")
         return False, "missing_expected_columns"
     
     print(f"[INGEST] Using text columns: {cols_to_use}")
     
-    # Create clean, structured documents with labeled fields
     def create_doc(row):
         parts = []
         for col in cols_to_use:
@@ -234,13 +229,12 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
     docs = [d for d in docs if d.strip()]
     
     if not docs:
-        print("[INGEST] ERROR: No documents were created from the DataFrame.")
+        print("[INGEST] ERROR: No documents created")
         return False, "no_documents_created"
     
     print(f"[INGEST] Created {len(docs)} clean documents")
-    print(f"[INGEST] Sample document: {docs[0][:200]}...")
+    print(f"[INGEST] Sample: {docs[0][:200]}...")
     
-    # Add documents in batches
     total_added = 0
     for i in range(0, len(docs), batch_docs):
         batch = docs[i:i+batch_docs]
@@ -259,16 +253,13 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
 
 
 def create_local_llm():
-    """Create a local HuggingFace Pipeline model optimized for DETAILED answers"""
-    if HuggingFacePipeline is None:
-        print("[LLM] HuggingFacePipeline not available.")
-        return None
-    if pipeline is None or AutoTokenizer is None or AutoModelForSeq2SeqLM is None:
-        print("[LLM] transformers library not available.")
+    """Create LLM optimized for both grounded and general answers"""
+    if HuggingFacePipeline is None or pipeline is None or AutoTokenizer is None:
+        print("[LLM] Required libraries not available.")
         return None
     
     try:
-        print(f"[LLM] Loading local model: {LOCAL_MODEL_ID}")
+        print(f"[LLM] Loading model: {LOCAL_MODEL_ID}")
         
         tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_ID)
         
@@ -279,35 +270,35 @@ def create_local_llm():
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text-generation"
         
-        # *** BALANCED SETTINGS FOR BOTH DETAILED AND LIST ANSWERS ***
+        # Balanced settings for both context-grounded and general knowledge
         pipe = pipeline(
             task,
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=512,        # Allow long answers
-            min_length=40,             # Minimum reasonable length
-            temperature=0.3,           # *** BALANCED: Not too creative, not too rigid ***
-            do_sample=True,            # Enable for natural language
-            top_p=0.95,                # Allow more diversity for listing
-            top_k=50,                  # Moderate diversity
-            repetition_penalty=1.3,    # *** INCREASED: Prevent "DDoS DDoS DDoS" ***
-            no_repeat_ngram_size=3,    # Prevent 3-gram repetition
-            early_stopping=False       # Let it complete the answer
+            max_new_tokens=512,
+            min_length=30,
+            temperature=0.4,           # Balanced creativity
+            do_sample=True,
+            top_p=0.95,
+            top_k=50,
+            repetition_penalty=1.3,
+            no_repeat_ngram_size=3,
+            early_stopping=False
         )
         
         llm = HuggingFacePipeline(pipeline=pipe)
         
-        print(f"[LLM] Local model loaded successfully: {LOCAL_MODEL_ID}")
+        print(f"[LLM] Model loaded successfully")
         return llm
         
     except Exception as e:
-        print(f"[LLM] Failed to load local model: {e}")
+        print(f"[LLM] Failed to load model: {e}")
         traceback.print_exc()
         return None
 
 def create_rag_chain(llm, vs):
     """
-    Create RAG chain with prompt optimized for BOTH explanations AND listing
+    Create HYBRID RAG chain that intelligently uses context OR general knowledge
     """
     if llm is None or vs is None:
         print("[RAG] Cannot create chain: llm or vs is None")
@@ -318,8 +309,8 @@ def create_rag_chain(llm, vs):
         return None
     
     try:
-        # *** CRITICAL: PROMPT THAT HANDLES BOTH LISTING AND EXPLANATION QUERIES ***
-        template = """You are a cybersecurity expert assistant. Answer the question based ONLY on the provided context from the database.
+        # *** HYBRID PROMPT: Uses context when relevant, general knowledge otherwise ***
+        template = """You are a helpful AI assistant with cybersecurity expertise.
 
 Context from database:
 {context}
@@ -327,14 +318,23 @@ Context from database:
 Question: {question}
 
 Instructions:
-1. Carefully read ALL the context documents above
-2. If the question asks to "list" or "what are the types", extract ALL UNIQUE items mentioned across all context documents
-3. If the question asks to "explain" or "what is", provide a detailed 3-5 sentence explanation
-4. For listing questions: Create a clear list or enumeration of unique items found in the context
-5. For explanation questions: Provide comprehensive details with examples from the context
-6. NEVER repeat the same item multiple times
-7. If information is not in the context, say "I cannot find this information in the provided context."
-8. Do NOT use general knowledge - use ONLY what's in the context above
+1. First, carefully examine if the provided context contains information relevant to answering the question
+2. If the context IS relevant:
+   - Base your answer primarily on the context
+   - Extract and list unique items if it's a listing question
+   - Provide detailed explanations if it's an explanation question
+   - Cite that your answer is "based on the database"
+3. If the context is NOT relevant or empty:
+   - Answer using your general cybersecurity knowledge
+   - Provide comprehensive information (definitions, full forms, explanations)
+   - Be clear that you're providing general information
+4. For listing questions:
+   - Extract ALL unique items from context (if relevant)
+   - OR provide a comprehensive general list (if context not relevant)
+5. For explanation questions:
+   - Provide 3-5 detailed sentences
+6. NEVER repeat the same information multiple times
+7. NEVER output instructions or meta-commentary
 
 Answer:"""
         
@@ -345,11 +345,10 @@ Answer:"""
                     template=template, 
                     input_variables=["context", "question"]
                 )
-                print("[RAG] Created optimized prompt for both listing and explanation")
+                print("[RAG] Created hybrid RAG prompt (context + general knowledge)")
             except Exception:
                 traceback.print_exc()
         
-        # Create RAG chain
         chain_type_kwargs = {}
         if prompt is not None:
             chain_type_kwargs["prompt"] = prompt
@@ -357,12 +356,12 @@ Answer:"""
         rag = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
-            retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),  # Retrieve 10 docs
+            retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),
             chain_type_kwargs=chain_type_kwargs,
             return_source_documents=True
         )
         
-        print("[RAG] RAG chain created successfully with optimized prompt")
+        print("[RAG] Hybrid RAG chain created successfully")
         return rag
         
     except Exception as e:
@@ -377,46 +376,34 @@ async def lifespan(app: FastAPI):
     ml_models["embedding_function"] = create_embedding_function()
     ml_models["vector_store"] = init_chroma(ml_models["embedding_function"])
     vs = ml_models["vector_store"]
-    print(f"[LIFESPAN] vector_store object: {type(vs).__name__ if vs is not None else None}")
 
     csv_path = find_csv_path()
     if csv_path:
-        print(f"[LIFESPAN] Found CSV at: {csv_path}")
-    else:
-        print("[LIFESPAN] No sampled CSV found automatically.")
-
+        print(f"[LIFESPAN] Found CSV: {csv_path}")
+    
     if vs is not None and csv_path:
         try:
             cnt = vs_count_estimate(vs)
-            print(f"[LIFESPAN] vector store estimated count: {cnt}")
             if cnt == 0:
-                print("[LIFESPAN] Auto-ingesting CSV (may take time)...")
+                print("[LIFESPAN] Auto-ingesting CSV...")
                 df = load_dataframe_from_csv(csv_path)
                 if df is not None and len(df) > 0:
                     ok, info = ingest_dataframe(df, vs, batch_docs=500)
-                    print("[LIFESPAN] ingest result:", ok, info)
+                    print("[LIFESPAN] Ingest result:", ok, info)
         except Exception:
             traceback.print_exc()
-    else:
-        print("[LIFESPAN] Skipping auto-ingest (no vs or no csv)")
 
-    print("[LIFESPAN] Loading local LLM (this may take a minute)...")
+    print("[LIFESPAN] Loading LLM...")
     ml_models["local_llm"] = create_local_llm()
     
     if ml_models["local_llm"] is not None and vs is not None:
         ml_models["rag_chain"] = create_rag_chain(ml_models["local_llm"], vs)
     
-    print("[LIFESPAN] startup complete:", {
-        "vector_store_ready": vs is not None,
-        "vector_store_count": vs_count_estimate(vs) if vs is not None else 0,
-        "local_llm_ready": ml_models.get("local_llm") is not None,
-        "rag_chain_ready": ml_models.get("rag_chain") is not None,
-        "csv_found": bool(csv_path)
-    })
+    print("[LIFESPAN] Startup complete")
     
     yield
     ml_models.clear()
-    print("[LIFESPAN] shutdown complete.")
+    print("[LIFESPAN] Shutdown complete")
 
 app = FastAPI(lifespan=lifespan)
 
@@ -428,7 +415,7 @@ class QueryResponse(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "Text Generation (RAG) Service running with LOCAL models."}
+    return {"status": "Hybrid RAG Service with context + general knowledge"}
 
 @app.get("/status")
 def status():
@@ -436,13 +423,12 @@ def status():
     count = vs_count_estimate(vs) if vs is not None else 0
     return {
         "vector_store_ready": vs is not None,
-        "vector_store_has_data": count > 0,
         "vector_store_count": int(count),
         "local_llm_ready": ml_models.get("local_llm") is not None,
         "rag_chain_ready": ml_models.get("rag_chain") is not None,
         "model_id": LOCAL_MODEL_ID,
         "top_k": TOP_K,
-        "csv_found": bool(find_csv_path())
+        "mode": "hybrid_rag"
     }
 
 @app.post("/upload-csv")
@@ -463,56 +449,50 @@ async def upload_csv(file: UploadFile = File(...), save_name: Optional[str] = Fo
 def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
     vs = ml_models.get("vector_store")
     if vs is None:
-        raise HTTPException(status_code=503, detail="Vector store not available.")
+        raise HTTPException(status_code=503, detail="Vector store not available")
     csv_path = find_csv_path()
     if csv_path is None:
-        raise HTTPException(status_code=404, detail="CSV not found.")
+        raise HTTPException(status_code=404, detail="CSV not found")
     df = load_dataframe_from_csv(csv_path)
     if df is None or len(df) == 0:
-        raise HTTPException(status_code=400, detail="CSV empty or unreadable.")
+        raise HTTPException(status_code=400, detail="CSV empty")
     if sample_limit is not None:
         df = df.head(sample_limit)
     
     try:
-        print("[INGEST] Clearing old data from vector store...")
         if hasattr(vs, "_collection"):
             vs._collection.delete(ids=vs._collection.get()['ids'])
-            print("[INGEST] Old data cleared.")
-        else:
-            print("[INGEST] Could not automatically clear old data. Re-ingesting anyway.")
+            print("[INGEST] Old data cleared")
     except Exception as e:
-        print(f"[INGEST] Error clearing old data: {e}. Continuing...")
-        traceback.print_exc()
+        print(f"[INGEST] Error clearing: {e}")
 
     ok, info = ingest_dataframe(df, vs, batch_docs=batch_size)
     if not ok:
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {info}")
     
-    final_count = vs_count_estimate(vs)
-    return {"status": "ingested", "method_info": info, "final_count": int(final_count)}
+    return {"status": "ingested", "info": info, "count": vs_count_estimate(vs)}
 
 @app.get("/get-csv-columns")
 def get_csv_columns():
     csv_path = find_csv_path()
     if csv_path is None:
-        raise HTTPException(status_code=404, detail="CSV not found.")
+        raise HTTPException(status_code=404, detail="CSV not found")
     df = load_dataframe_from_csv(csv_path)
     if df is None:
-        raise HTTPException(status_code=400, detail="CSV empty or unreadable.")
+        raise HTTPException(status_code=400, detail="CSV unreadable")
     return {"columns": list(df.columns)}
 
 @app.post("/generate-text", response_model=QueryResponse)
 def generate_text(req: QueryRequest):
     """
-    Generate answers using RAG - handles both listing and detailed explanation queries
+    HYBRID RAG: Uses context when relevant, general knowledge otherwise
     """
     if not req.query or not req.query.strip():
-        raise HTTPException(status_code=400, detail="Query cannot be empty.")
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
     
     rag = ml_models.get("rag_chain")
-
     if rag is None:
-        raise HTTPException(status_code=503, detail="RAG chain not available. Model may still be loading.")
+        raise HTTPException(status_code=503, detail="RAG chain not available")
     
     try:
         print("\n" + "="*80)
@@ -522,6 +502,7 @@ def generate_text(req: QueryRequest):
         out_text = None
         source_docs = []
         
+        # Invoke RAG chain
         if hasattr(rag, "invoke"):
             res = rag.invoke({"query": req.query})
             if isinstance(res, dict):
@@ -537,37 +518,50 @@ def generate_text(req: QueryRequest):
             else:
                 out_text = str(res)
         else:
-            raise HTTPException(status_code=500, detail="RAG chain invocation method not found")
+            raise HTTPException(status_code=500, detail="RAG invocation failed")
         
         # Log retrieved context
         if source_docs:
-            print(f"\n[CONTEXT] Retrieved {len(source_docs)} document(s):")
-            # Extract unique attack types from context for debugging
-            attack_types_in_context = set()
-            for i, doc in enumerate(source_docs):
-                print(f"\n  --- Document {i+1} ---")
-                print(f"  {doc.page_content[:300]}...")
-                # Extract attack type if present
+            print(f"\n[CONTEXT] Retrieved {len(source_docs)} documents")
+            # Extract attack types for debugging
+            attack_types = set()
+            for i, doc in enumerate(source_docs[:3]):  # Show first 3
+                print(f"  Doc {i+1}: {doc.page_content[:200]}...")
                 if "Attack Type:" in doc.page_content:
                     try:
-                        attack_type = doc.page_content.split("Attack Type:")[1].split(".")[0].strip()
-                        attack_types_in_context.add(attack_type)
+                        at = doc.page_content.split("Attack Type:")[1].split(".")[0].strip()
+                        attack_types.add(at)
                     except:
                         pass
-            
-            if attack_types_in_context:
-                print(f"\n[DEBUG] Unique attack types found in context: {attack_types_in_context}")
+            if attack_types:
+                print(f"  Found attack types: {attack_types}")
         else:
-            print("\n[WARNING] No source documents were returned!")
+            print("\n[CONTEXT] No documents retrieved (will use general knowledge)")
         
         if out_text is None:
-            print("[ERROR] Failed to extract 'result' from RAG chain response.")
-            raise HTTPException(status_code=500, detail="Failed to get 'result' from RAG chain.")
+            raise HTTPException(status_code=500, detail="Failed to get result")
         
         out_text = str(out_text).strip()
         
+        # Clean up any instruction leakage
+        bad_phrases = [
+            "Instructions:",
+            "Do NOT",
+            "NEVER",
+            "You must",
+            "based ONLY on"
+        ]
+        for phrase in bad_phrases:
+            if phrase in out_text:
+                # If instructions leaked, try to extract just the answer
+                parts = out_text.split("\n\n")
+                for part in parts:
+                    if not any(bp in part for bp in bad_phrases) and len(part) > 50:
+                        out_text = part
+                        break
+        
         print(f"\n[ANSWER] {out_text}")
-        print(f"[ANSWER LENGTH] {len(out_text.split())} words, {len(out_text.split('.'))} sentences")
+        print(f"[LENGTH] {len(out_text.split())} words")
         print("="*80 + "\n")
         
         return QueryResponse(answer=out_text)
