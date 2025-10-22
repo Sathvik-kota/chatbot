@@ -344,7 +344,7 @@ Answer:"""
             chain_type="stuff",
             retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),
             chain_type_kwargs=chain_type_kwargs,
-            return_source_documents=False
+            return_source_documents=True  # *** CHANGED: We want to see the documents
         )
         
         print("[RAG] RAG chain created successfully")
@@ -493,19 +493,44 @@ def generate_text(req: QueryRequest):
         raise HTTPException(status_code=503, detail="RAG chain not available. Model may still be loading.")
     
     try:
+        # --- NEW DEBUGGING LOGIC ---
+        print("\n--- NEW QUERY RECEIVED ---")
+        print(f"Query: {req.query}")
+        
         # Try different invocation methods
+        out_text = None
+        source_docs = []
+
         if hasattr(rag, "run"):
-            out = rag.run(req.query)
-            return QueryResponse(answer=str(out).strip())
+            # .run is simple, doesn't return sources
+            out_text = rag.run(req.query)
         elif hasattr(rag, "invoke"):
+            # .invoke returns a dict, which should have sources
             res = rag.invoke({"query": req.query})
-            answer = res.get("result") if isinstance(res, dict) else res
-            return QueryResponse(answer=str(answer).strip())
+            if isinstance(res, dict):
+                out_text = res.get("result")
+                source_docs = res.get("source_documents")
+            else:
+                out_text = str(res)
         elif callable(rag):
-            out = rag(req.query)
-            return QueryResponse(answer=str(out).strip())
+            # Fallback for older chain types
+            out_text = rag(req.query)
         else:
             raise HTTPException(status_code=500, detail="RAG chain invocation method not found")
+
+        # --- LOG THE RETRIEVED CONTEXT ---
+        if source_docs:
+            print(f"[DEBUG] Retrieved {len(source_docs)} source document(s):")
+            for i, doc in enumerate(source_docs):
+                print(f"  DOC {i+1}: {doc.page_content[:500]}...") # Log first 500 chars
+        else:
+            print("[DEBUG] No source documents were returned by the chain.")
+        
+        print(f"Generated Answer: {out_text}")
+        print("--- QUERY COMPLETE ---")
+        
+        return QueryResponse(answer=str(out_text).strip())
+
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
