@@ -1,4 +1,4 @@
- textgen_service/main.py
+# textgen_service/main.py
 # TESTED WORKING VERSION WITH CHROMADB - NO ERRORS
 import os
 import traceback
