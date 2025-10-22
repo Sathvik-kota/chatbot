@@ -1,6 +1,6 @@
 """
-Robust RAG service with LOCAL MODEL support - FINAL VERSION WITH DETAILED ANSWERS
-This version forces the model to generate detailed 3-5 sentence explanations
+Robust RAG service with LOCAL MODEL support - FINAL FIXED VERSION
+Handles both detailed explanations AND listing/aggregation queries correctly
 """
 import os
 import traceback
@@ -65,7 +65,7 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 # Use a SMALL local model that works well for Q&A
 LOCAL_MODEL_ID = "google/flan-t5-base"  # Using base for better quality
 
-TOP_K = 3  # Use top 3 documents for better context
+TOP_K = 10  # *** INCREASED: Retrieve more documents for listing/aggregation queries ***
 
 # ---------------- Globals ----------------
 ml_models = {
@@ -279,20 +279,20 @@ def create_local_llm():
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text-generation"
         
-        # *** OPTIMIZED FOR DETAILED GENERATION ***
+        # *** BALANCED SETTINGS FOR BOTH DETAILED AND LIST ANSWERS ***
         pipe = pipeline(
             task,
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=512,        # *** INCREASED: Allow much longer detailed answers ***
-            min_length=50,             # *** NEW: Force minimum answer length ***
-            temperature=0.1,           # *** SLIGHTLY INCREASED: Allows more natural language ***
-            do_sample=True,            # *** CHANGED: Enable sampling for better sentences ***
-            top_p=0.9,                 # *** NEW: Nucleus sampling for coherent text ***
-            top_k=50,                  # *** NEW: Top-k sampling for diversity ***
-            repetition_penalty=1.2,    # *** INCREASED: Discourage repetition ***
-            no_repeat_ngram_size=3,    # *** NEW: Prevent 3-gram repetition ***
-            early_stopping=False       # *** CHANGED: Let it generate full answers ***
+            max_new_tokens=512,        # Allow long answers
+            min_length=40,             # Minimum reasonable length
+            temperature=0.3,           # *** BALANCED: Not too creative, not too rigid ***
+            do_sample=True,            # Enable for natural language
+            top_p=0.95,                # Allow more diversity for listing
+            top_k=50,                  # Moderate diversity
+            repetition_penalty=1.3,    # *** INCREASED: Prevent "DDoS DDoS DDoS" ***
+            no_repeat_ngram_size=3,    # Prevent 3-gram repetition
+            early_stopping=False       # Let it complete the answer
         )
         
         llm = HuggingFacePipeline(pipeline=pipe)
@@ -307,8 +307,7 @@ def create_local_llm():
 
 def create_rag_chain(llm, vs):
     """
-    Create RAG chain with EXPLICIT INSTRUCTIONS for detailed answers
-    FLAN-T5 needs very explicit prompts to generate longer responses
+    Create RAG chain with prompt optimized for BOTH explanations AND listing
     """
     if llm is None or vs is None:
         print("[RAG] Cannot create chain: llm or vs is None")
@@ -319,24 +318,25 @@ def create_rag_chain(llm, vs):
         return None
     
     try:
-        # *** CRITICAL: FLAN-T5 NEEDS EXPLICIT LENGTH INSTRUCTIONS ***
-        # Research shows FLAN-T5 responds well to clear instructions about output format
-        template = """Answer the following question based on the provided context. You MUST write a detailed explanation with at least 3-5 complete sentences.
+        # *** CRITICAL: PROMPT THAT HANDLES BOTH LISTING AND EXPLANATION QUERIES ***
+        template = """You are a cybersecurity expert assistant. Answer the question based ONLY on the provided context from the database.
 
-Context: {context}
+Context from database:
+{context}
 
 Question: {question}
 
 Instructions:
-1. Read the context carefully and identify all relevant information
-2. Write a comprehensive answer explaining the topic in detail
-3. Your answer MUST be at least 3-5 sentences long
-4. Include specific details, examples, and explanations from the context
-5. If the information is not in the context, write "I cannot find this information in the provided context."
-6. Do NOT write short one-word or one-sentence answers
-7. Explain thoroughly like you are teaching someone
+1. Carefully read ALL the context documents above
+2. If the question asks to "list" or "what are the types", extract ALL UNIQUE items mentioned across all context documents
+3. If the question asks to "explain" or "what is", provide a detailed 3-5 sentence explanation
+4. For listing questions: Create a clear list or enumeration of unique items found in the context
+5. For explanation questions: Provide comprehensive details with examples from the context
+6. NEVER repeat the same item multiple times
+7. If information is not in the context, say "I cannot find this information in the provided context."
+8. Do NOT use general knowledge - use ONLY what's in the context above
 
-Detailed Answer (3-5 sentences):"""
+Answer:"""
         
         prompt = None
         if PromptTemplate is not None:
@@ -345,7 +345,7 @@ Detailed Answer (3-5 sentences):"""
                     template=template, 
                     input_variables=["context", "question"]
                 )
-                print("[RAG] Created detailed answer prompt template for FLAN-T5")
+                print("[RAG] Created optimized prompt for both listing and explanation")
             except Exception:
                 traceback.print_exc()
         
@@ -357,12 +357,12 @@ Detailed Answer (3-5 sentences):"""
         rag = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
-            retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),
+            retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),  # Retrieve 10 docs
             chain_type_kwargs=chain_type_kwargs,
             return_source_documents=True
         )
         
-        print("[RAG] RAG chain created successfully with detailed answer prompt")
+        print("[RAG] RAG chain created successfully with optimized prompt")
         return rag
         
     except Exception as e:
@@ -441,6 +441,7 @@ def status():
         "local_llm_ready": ml_models.get("local_llm") is not None,
         "rag_chain_ready": ml_models.get("rag_chain") is not None,
         "model_id": LOCAL_MODEL_ID,
+        "top_k": TOP_K,
         "csv_found": bool(find_csv_path())
     }
 
@@ -503,7 +504,7 @@ def get_csv_columns():
 @app.post("/generate-text", response_model=QueryResponse)
 def generate_text(req: QueryRequest):
     """
-    Generate detailed answers using RAG with proper context
+    Generate answers using RAG - handles both listing and detailed explanation queries
     """
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
@@ -541,9 +542,21 @@ def generate_text(req: QueryRequest):
         # Log retrieved context
         if source_docs:
             print(f"\n[CONTEXT] Retrieved {len(source_docs)} document(s):")
+            # Extract unique attack types from context for debugging
+            attack_types_in_context = set()
             for i, doc in enumerate(source_docs):
                 print(f"\n  --- Document {i+1} ---")
-                print(f"  {doc.page_content[:500]}...")
+                print(f"  {doc.page_content[:300]}...")
+                # Extract attack type if present
+                if "Attack Type:" in doc.page_content:
+                    try:
+                        attack_type = doc.page_content.split("Attack Type:")[1].split(".")[0].strip()
+                        attack_types_in_context.add(attack_type)
+                    except:
+                        pass
+            
+            if attack_types_in_context:
+                print(f"\n[DEBUG] Unique attack types found in context: {attack_types_in_context}")
         else:
             print("\n[WARNING] No source documents were returned!")
         
