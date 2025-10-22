@@ -69,9 +69,8 @@ async def lifespan(app: FastAPI):
     vs = ml_models.get("vector_store")
     if vs:
         try:
-            # CHANGE #1: Use .count() instead of .get()
-            collection_count = vs._collection.count()
-            if collection_count == 0:
+            docs_in_store = vs._collection.get(include=['documents'])['documents']
+            if len(docs_in_store) == 0:
                 df = load_csv()
                 if df is not None:
                     # Convert each row to a simple string representation
@@ -79,10 +78,8 @@ async def lifespan(app: FastAPI):
                     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
                     chunks = splitter.split_text("\n\n".join(docs))
                     vs.add_texts(texts=chunks)
-                    # CHANGE #2: Remove vs.persist() - auto-persists
+                    vs.persist()
                     print(f"Ingested {len(docs)} docs -> {len(chunks)} chunks.")
-            else:
-                print(f"Vector store already has {collection_count} items.")
         except Exception:
             traceback.print_exc()
 
@@ -144,10 +141,8 @@ async def generate_text(req: QueryRequest):
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
     try:
-        # CHANGE #3: Use .invoke() instead of .run()
-        result = ml_models["rag_chain"].invoke({"query": req.query})
-        answer = result.get("result", "No answer generated.")
-        return QueryResponse(answer=str(answer))
+        out = ml_models["rag_chain"].run(req.query)
+        return QueryResponse(answer=str(out) if out is not None else "No answer generated.")
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
