@@ -1,6 +1,6 @@
 """
-Robust RAG service with LOCAL MODEL support - COMPLETELY FIXED VERSION
-This version properly retrieves context and forces the model to use it
+Robust RAG service with LOCAL MODEL support - FINAL VERSION WITH DETAILED ANSWERS
+This version forces the model to generate detailed 3-5 sentence explanations
 """
 import os
 import traceback
@@ -65,7 +65,7 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 # Use a SMALL local model that works well for Q&A
 LOCAL_MODEL_ID = "google/flan-t5-base"  # Using base for better quality
 
-TOP_K = 3  # *** CHANGED: Use top 3 documents for better context ***
+TOP_K = 3  # Use top 3 documents for better context
 
 # ---------------- Globals ----------------
 ml_models = {
@@ -199,14 +199,12 @@ def _try_add_texts(vs, texts):
 
 def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
     """
-    *** COMPLETELY REWRITTEN ***
-    This version creates CLEAN, MEANINGFUL documents from ONLY the relevant columns
+    Creates CLEAN, MEANINGFUL documents from ONLY the relevant columns
     """
     if df is None or vs is None:
         return False, "no_df_or_vs"
 
-    # --- *** USE ONLY MEANINGFUL TEXT COLUMNS *** ---
-    # These columns contain the actual cybersecurity information
+    # Use ONLY meaningful text columns
     USEFUL_COLUMNS = [
         "Attack Type",
         "Attack Severity", 
@@ -214,10 +212,7 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
         "Response Action"
     ]
     
-    # Get lowercased versions of actual columns
     df_cols_lower = {col.lower(): col for col in df.columns}
-    
-    # Find the original-cased column names that match our useful list
     cols_to_use = [df_cols_lower[col_name.lower()] for col_name in USEFUL_COLUMNS if col_name.lower() in df_cols_lower]
 
     if not cols_to_use:
@@ -232,13 +227,10 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
         parts = []
         for col in cols_to_use:
             if pd.notna(row[col]) and str(row[col]).strip():
-                # Create labeled fields for better RAG retrieval
                 parts.append(f"{col}: {row[col]}")
         return ". ".join(parts) if parts else ""
     
     docs = df.apply(create_doc, axis=1).tolist()
-    
-    # Filter out any empty documents
     docs = [d for d in docs if d.strip()]
     
     if not docs:
@@ -267,7 +259,7 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
 
 
 def create_local_llm():
-    """Create a local HuggingFace Pipeline model with STRICT factual settings"""
+    """Create a local HuggingFace Pipeline model optimized for DETAILED answers"""
     if HuggingFacePipeline is None:
         print("[LLM] HuggingFacePipeline not available.")
         return None
@@ -280,7 +272,6 @@ def create_local_llm():
         
         tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_ID)
         
-        # For T5/Flan-T5 models (seq2seq)
         if "t5" in LOCAL_MODEL_ID.lower():
             model = AutoModelForSeq2SeqLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text2text-generation"
@@ -288,16 +279,20 @@ def create_local_llm():
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text-generation"
         
-        # *** STRICT GREEDY DECODING - NO CREATIVITY ***
+        # *** OPTIMIZED FOR DETAILED GENERATION ***
         pipe = pipeline(
             task,
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=300,      # *** INCREASED: Allow longer answers ***
-            temperature=0.0,         # *** PURE GREEDY DECODING ***
-            do_sample=False,         # *** NO SAMPLING ***
-            repetition_penalty=1.0,  # *** NO PENALTY (can interfere with factual text) ***
-            early_stopping=True
+            max_new_tokens=512,        # *** INCREASED: Allow much longer detailed answers ***
+            min_length=50,             # *** NEW: Force minimum answer length ***
+            temperature=0.1,           # *** SLIGHTLY INCREASED: Allows more natural language ***
+            do_sample=True,            # *** CHANGED: Enable sampling for better sentences ***
+            top_p=0.9,                 # *** NEW: Nucleus sampling for coherent text ***
+            top_k=50,                  # *** NEW: Top-k sampling for diversity ***
+            repetition_penalty=1.2,    # *** INCREASED: Discourage repetition ***
+            no_repeat_ngram_size=3,    # *** NEW: Prevent 3-gram repetition ***
+            early_stopping=False       # *** CHANGED: Let it generate full answers ***
         )
         
         llm = HuggingFacePipeline(pipeline=pipe)
@@ -312,8 +307,8 @@ def create_local_llm():
 
 def create_rag_chain(llm, vs):
     """
-    *** COMPLETELY REWRITTEN ***
-    Create RAG chain with a STRICT prompt that FORCES the model to use context
+    Create RAG chain with EXPLICIT INSTRUCTIONS for detailed answers
+    FLAN-T5 needs very explicit prompts to generate longer responses
     """
     if llm is None or vs is None:
         print("[RAG] Cannot create chain: llm or vs is None")
@@ -324,33 +319,33 @@ def create_rag_chain(llm, vs):
         return None
     
     try:
-        # *** CRITICAL FIX: STRICT PROMPT THAT FORCES CONTEXT USAGE ***
-        # The key is to make it CRYSTAL CLEAR that the model should ONLY use the context
-        template = """You must answer based ONLY on the context below. Do not use any external knowledge.
+        # *** CRITICAL: FLAN-T5 NEEDS EXPLICIT LENGTH INSTRUCTIONS ***
+        # Research shows FLAN-T5 responds well to clear instructions about output format
+        template = """Answer the following question based on the provided context. You MUST write a detailed explanation with at least 3-5 complete sentences.
 
-Context (this is retrieved information from the database):
-{context}
+Context: {context}
 
 Question: {question}
 
 Instructions:
-1. Read the context carefully
-2. If the answer is in the context, extract and explain it in 3-5 sentences
-3. If the answer is NOT in the context, respond with: "I cannot find this information in the provided context."
-4. DO NOT make up information
-5. DO NOT use general knowledge
+1. Read the context carefully and identify all relevant information
+2. Write a comprehensive answer explaining the topic in detail
+3. Your answer MUST be at least 3-5 sentences long
+4. Include specific details, examples, and explanations from the context
+5. If the information is not in the context, write "I cannot find this information in the provided context."
+6. Do NOT write short one-word or one-sentence answers
+7. Explain thoroughly like you are teaching someone
 
-Answer:"""
+Detailed Answer (3-5 sentences):"""
         
         prompt = None
         if PromptTemplate is not None:
             try:
-                # *** CRITICAL: Use correct variable names ***
                 prompt = PromptTemplate(
                     template=template, 
                     input_variables=["context", "question"]
                 )
-                print("[RAG] Created strict context-forcing prompt template")
+                print("[RAG] Created detailed answer prompt template for FLAN-T5")
             except Exception:
                 traceback.print_exc()
         
@@ -361,13 +356,13 @@ Answer:"""
         
         rag = RetrievalQA.from_chain_type(
             llm=llm,
-            chain_type="stuff",  # "stuff" concatenates all docs into prompt
+            chain_type="stuff",
             retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),
             chain_type_kwargs=chain_type_kwargs,
             return_source_documents=True
         )
         
-        print("[RAG] RAG chain created successfully with strict prompt")
+        print("[RAG] RAG chain created successfully with detailed answer prompt")
         return rag
         
     except Exception as e:
@@ -379,15 +374,11 @@ Answer:"""
 async def lifespan(app: FastAPI):
     print("[LIFESPAN] starting up...")
     
-    # Embedding
     ml_models["embedding_function"] = create_embedding_function()
-    
-    # Chroma
     ml_models["vector_store"] = init_chroma(ml_models["embedding_function"])
     vs = ml_models["vector_store"]
     print(f"[LIFESPAN] vector_store object: {type(vs).__name__ if vs is not None else None}")
 
-    # Find CSV and auto-ingest if empty
     csv_path = find_csv_path()
     if csv_path:
         print(f"[LIFESPAN] Found CSV at: {csv_path}")
@@ -409,11 +400,9 @@ async def lifespan(app: FastAPI):
     else:
         print("[LIFESPAN] Skipping auto-ingest (no vs or no csv)")
 
-    # Create local LLM
     print("[LIFESPAN] Loading local LLM (this may take a minute)...")
     ml_models["local_llm"] = create_local_llm()
     
-    # Create RAG chain
     if ml_models["local_llm"] is not None and vs is not None:
         ml_models["rag_chain"] = create_rag_chain(ml_models["local_llm"], vs)
     
@@ -483,7 +472,6 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
     if sample_limit is not None:
         df = df.head(sample_limit)
     
-    # Clear old data
     try:
         print("[INGEST] Clearing old data from vector store...")
         if hasattr(vs, "_collection"):
@@ -495,7 +483,6 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
         print(f"[INGEST] Error clearing old data: {e}. Continuing...")
         traceback.print_exc()
 
-    # Ingest clean data
     ok, info = ingest_dataframe(df, vs, batch_docs=batch_size)
     if not ok:
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {info}")
@@ -516,8 +503,7 @@ def get_csv_columns():
 @app.post("/generate-text", response_model=QueryResponse)
 def generate_text(req: QueryRequest):
     """
-    *** COMPLETELY REWRITTEN ***
-    This version ALWAYS uses RAG and properly logs the retrieved context
+    Generate detailed answers using RAG with proper context
     """
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
@@ -532,11 +518,9 @@ def generate_text(req: QueryRequest):
         print(f"[QUERY] {req.query}")
         print("="*80)
         
-        # *** ALWAYS USE RAG - NO BYPASSING ***
         out_text = None
         source_docs = []
         
-        # Use .invoke() to get both result and source documents
         if hasattr(rag, "invoke"):
             res = rag.invoke({"query": req.query})
             if isinstance(res, dict):
@@ -545,7 +529,6 @@ def generate_text(req: QueryRequest):
             else:
                 out_text = str(res)
         elif hasattr(rag, "__call__"):
-            # Fallback for older versions
             res = rag({"query": req.query})
             if isinstance(res, dict):
                 out_text = res.get("result")
@@ -555,7 +538,7 @@ def generate_text(req: QueryRequest):
         else:
             raise HTTPException(status_code=500, detail="RAG chain invocation method not found")
         
-        # *** LOG THE RETRIEVED CONTEXT ***
+        # Log retrieved context
         if source_docs:
             print(f"\n[CONTEXT] Retrieved {len(source_docs)} document(s):")
             for i, doc in enumerate(source_docs):
@@ -568,10 +551,10 @@ def generate_text(req: QueryRequest):
             print("[ERROR] Failed to extract 'result' from RAG chain response.")
             raise HTTPException(status_code=500, detail="Failed to get 'result' from RAG chain.")
         
-        # Clean up the output
         out_text = str(out_text).strip()
         
         print(f"\n[ANSWER] {out_text}")
+        print(f"[ANSWER LENGTH] {len(out_text.split())} words, {len(out_text.split('.'))} sentences")
         print("="*80 + "\n")
         
         return QueryResponse(answer=out_text)
