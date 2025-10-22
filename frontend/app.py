@@ -41,7 +41,7 @@ if feature == "Sentiment Analysis":
                     resp = requests.post(f"{BASE_SENTIMENT}/predict", json={"text": text}, timeout=30)
                 if resp.status_code == 200:
                     j = resp.json()
-                    st.success(f"Sentiment: **{j.get('sentiment')}**  (score: {j.get('score', j.get('confidence', 'n/a'))})")
+                    st.success(f"Sentiment: **{j.get('sentiment')}** (score: {j.get('score', j.get('confidence', 'n/a'))})")
                     if "probabilities" in j:
                         st.json(j["probabilities"])
                 else:
@@ -59,7 +59,8 @@ elif feature == "RAG / Text Generation":
         else:
             try:
                 with st.spinner("Generating..."):
-                    resp = requests.post(f"{BASE_TEXTGEN}/generate", json={"query": query}, timeout=60)
+                    # *** FIXED: Changed endpoint from /generate to /generate-text ***
+                    resp = requests.post(f"{BASE_TEXTGEN}/generate-text", json={"query": query}, timeout=60)
                 if resp.status_code == 200:
                     answer = resp.json().get("answer") or resp.json().get("result") or resp.text
                     st.markdown("**Answer:**")
