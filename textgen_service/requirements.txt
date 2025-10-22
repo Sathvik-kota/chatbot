@@ -1,13 +1,19 @@
-fastapi==0.95.2
+pydantic==1.10.12
+transformers==4.35.0
+tokenizers==0.14.1
+astapi==0.95.2
 uvicorn[standard]==0.22.0
+
+# Data
 pandas==2.1.1
+
+# Vector DB
 chromadb==0.4.7
+
+# Embeddings & transformers
 sentence-transformers==2.2.2
-transformers==4.44.2
-tokenizers==0.19.1
-# If you want to pin torch, do so OR rely on your installed torch (you said you have 2.8.0+cu126)
-# torch==2.8.0+cu126
-langchain==0.3.27
+langchain==0.0.350
 langchain-text-splitters==0.3.11
-langchain-huggingface==0.1.0
+
+# environment helpers
 python-dotenv==1.1.1
