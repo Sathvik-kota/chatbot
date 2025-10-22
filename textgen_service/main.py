@@ -1,56 +1,50 @@
 # textgen_service/main.py
 """
-Robust TextGen (RAG) service tuned to:
-  /content/project/textgen_service/ai_cybersecurity_dataset-sampled-5k.csv
+Robust RAG service using huggingface_hub.InferenceClient for generation.
+Designed to work with the file:
+  ai_cybersecurity_dataset-sampled-5k.csv
+placed in the same directory as this file (or in ./documents/).
 
-This version:
- - Keeps robust/langchain-chroma import fallbacks
- - Uses huggingface_hub.InferenceClient for generation (Mistral / Mixtral)
- - Retains endpoints: /status, /upload-csv, /force-ingest, /generate-text
- - Safe, defensive code paths for many langchain / chroma versions
+Endpoints:
+ - GET  /status
+ - POST /upload-csv  (multipart upload)
+ - POST /force-ingest (optional sample_limit)
+ - POST /generate-text  {"query": "..."}
 """
 
 import os
 import traceback
 import pandas as pd
-from typing import Optional, List, Any
+import requests
+from typing import Optional
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
-# -------------------------
-# HF Inference Client (for Mistral/Mixtral)
-# -------------------------
-from huggingface_hub import InferenceClient
+# Hugging Face inference client
+try:
+    from huggingface_hub import InferenceClient
+except Exception:
+    InferenceClient = None
 
-# -------------------------
-# Try imports (robust)
-# -------------------------
+# langchain-community / chroma imports (robust)
 try:
     from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
 except Exception:
     SentenceTransformerEmbeddings = None
 
 try:
-    from langchain_community.llms import HuggingFaceHub  # kept as optional fallback
-except Exception:
-    HuggingFaceHub = None
-
-try:
     from langchain_community.vectorstores import Chroma as LC_Chroma
 except Exception:
     LC_Chroma = None
 
-# RetrievalQA
+# Try retrieval chain import (not strictly required because we implement our own prompt + inference)
 try:
     from langchain.chains import RetrievalQA
 except Exception:
-    try:
-        from langchain_community.chains import RetrievalQA
-    except Exception:
-        RetrievalQA = None
+    RetrievalQA = None
 
-# Text splitter (try common packages; fallback to simple splitter)
+# Text splitter fallback
 RecursiveCharacterTextSplitter = None
 for mod in ("langchain_text_splitters", "langchain.text_splitter", "langchain_community.text_splitter"):
     try:
@@ -65,7 +59,7 @@ if RecursiveCharacterTextSplitter is None:
         def __init__(self, chunk_size=1000, chunk_overlap=100):
             self.chunk_size = chunk_size
             self.chunk_overlap = chunk_overlap
-        def split_text(self, text: str):
+        def split_text(self, text):
             chunks = []
             i, n = 0, len(text)
             while i < n:
@@ -73,39 +67,36 @@ if RecursiveCharacterTextSplitter is None:
                 i += max(1, self.chunk_size - self.chunk_overlap)
             return chunks
 
-# -------------------------
-# Configuration (user-specified CSV path)
-# -------------------------
+# ---------------- Config ----------------
 ROOT_DIR = os.path.dirname(__file__) or os.getcwd()
 CHROMA_DB_PATH = os.path.join(ROOT_DIR, "chroma_db")
 DOCUMENTS_DIR = os.path.join(ROOT_DIR, "documents")
 
-# Exact path user provided earlier
-HARDCODED_CSV_PATH = "/content/project/textgen_service/ai_cybersecurity_dataset-sampled-5k.csv"
+# The CSV location you reported is in the project root / textgen_service folder.
+HARDCODED_CSV_PATH = os.path.join(ROOT_DIR, "ai_cybersecurity_dataset-sampled-5k.csv")
 DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
-# Model to call via InferenceClient (change via env if you wish)
-PRIMARY_REPO_ID = os.getenv("RAG_MODEL_ID", "mistralai/Mixtral-8x7B-Instruct-v0.1")
-FALLBACK_SMALL_REPO_ID = "google/flan-t5-small"
+# Primary large model (may be gated or not hosted on inference); fallback to flan-t5-small
+PRIMARY_REPO_ID = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+FALLBACK_REPO_ID = "google/flan-t5-small"
 
-# -------------------------
+# Retriever settings
+TOP_K = 4  # number of docs to include in context
+
 # Globals
-# -------------------------
 ml_models = {
     "embedding_function": None,
     "vector_store": None,
-    "rag_chain": None,   # will hold RAGWrapper instance or None
-    "hf_inference_client": None
+    "hf_inference_client": None,
+    "hf_model_id": None
 }
 
-# -------------------------
-# Helper functions
-# -------------------------
+# ---------------- Helpers ----------------
+
 def find_csv_path(basename: str = DEFAULT_CSV_BASENAME) -> Optional[str]:
-    """Look for CSV in several likely locations (including the exact path)."""
     candidates = [
         HARDCODED_CSV_PATH,
         os.path.join(DOCUMENTS_DIR, basename),
@@ -141,7 +132,7 @@ def create_embedding_function():
         return None
 
 def init_chroma(embedding_function):
-    """Try several initialization patterns for langchain_community.Chroma wrappers."""
+    # try several initialization patterns for langchain_community.Chroma
     try:
         os.makedirs(CHROMA_DB_PATH, exist_ok=True)
     except Exception:
@@ -151,7 +142,7 @@ def init_chroma(embedding_function):
         print("[CHROMA] langchain_community.Chroma import not available.")
         return None
 
-    # pattern 1: persist_directory (common)
+    # 1) persist_directory pattern (common)
     try:
         vs = LC_Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=embedding_function)
         print("[CHROMA] Initialized with persist_directory.")
@@ -159,7 +150,7 @@ def init_chroma(embedding_function):
     except Exception:
         traceback.print_exc()
 
-    # pattern 2: client-based (older)
+    # 2) client-based pattern (older)
     try:
         import chromadb
         try:
@@ -173,7 +164,7 @@ def init_chroma(embedding_function):
     except Exception:
         traceback.print_exc()
 
-    # fallback: in-memory
+    # 3) in-memory fallback
     try:
         vs = LC_Chroma(embedding_function=embedding_function)
         print("[CHROMA] Initialized in-memory Chroma.")
@@ -184,7 +175,6 @@ def init_chroma(embedding_function):
     return None
 
 def vs_count_estimate(vs) -> int:
-    """Try multiple ways to estimate count."""
     if vs is None:
         return 0
     try:
@@ -203,16 +193,13 @@ def vs_count_estimate(vs) -> int:
         traceback.print_exc()
     return 0
 
-def _try_add_texts(vs, texts: List[str]):
-    """Try a few add APIs and return (ok, method)."""
-    # 1) add_texts
+def _try_add_texts(vs, texts):
     try:
         if hasattr(vs, "add_texts"):
             vs.add_texts(texts=texts)
             return True, "add_texts"
     except Exception:
         traceback.print_exc()
-    # 2) add_documents
     try:
         if hasattr(vs, "add_documents"):
             docs = [{"page_content": t, "metadata": {}} for t in texts]
@@ -220,7 +207,6 @@ def _try_add_texts(vs, texts: List[str]):
             return True, "add_documents"
     except Exception:
         traceback.print_exc()
-    # 3) low-level collection
     try:
         col = getattr(vs, "_collection", None) or getattr(vs, "collection", None)
         if col is not None and hasattr(col, "add"):
@@ -231,7 +217,7 @@ def _try_add_texts(vs, texts: List[str]):
             return True, "_collection.add"
     except Exception:
         traceback.print_exc()
-    # 4) iterative fallback
+    # iterative fallback
     try:
         for t in texts:
             if hasattr(vs, "add_texts"):
@@ -241,11 +227,9 @@ def _try_add_texts(vs, texts: List[str]):
         traceback.print_exc()
     return False, None
 
-def ingest_dataframe(df: pd.DataFrame, vs, batch_docs:int=500):
-    """Ingest dataframe into vectorstore in batches. Returns (ok, info)."""
+def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
     if df is None or vs is None:
         return False, "no_df_or_vs"
-    # convert rows to compact text strings
     docs = df.fillna("").apply(lambda r: " | ".join([f"{c}: {r[c]}" for c in df.columns]), axis=1).tolist()
     total_added = 0
     for i in range(0, len(docs), batch_docs):
@@ -254,7 +238,6 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs:int=500):
         if not ok:
             return False, f"batch_failed_at_{i}"
         total_added += len(batch)
-    # persist if available
     try:
         if hasattr(vs, "persist"):
             vs.persist()
@@ -262,163 +245,178 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs:int=500):
         traceback.print_exc()
     return True, {"method": method, "docs_added": total_added}
 
-# -------------------------
-# HF InferenceClient RAG wrapper
-# -------------------------
-def extract_text_from_inference_response(resp: Any) -> str:
-    """
-    Normalize the InferenceClient.text_generation response.
-    It can be dict, list, or other forms depending on hf-hub version.
-    """
+def check_inference_endpoint(repo_id: str, token: str, timeout: int = 8) -> bool:
+    """Return True if inference API endpoint for repo_id is reachable with token."""
+    if not token:
+        return False
+    url = f"https://api-inference.huggingface.co/models/{repo_id}"
+    headers = {"Authorization": f"Bearer {token}"}
     try:
-        if resp is None:
-            return ""
-        # If it's dict with 'generated_text'
-        if isinstance(resp, dict):
-            # some versions: {'generated_text': '...'}
-            if "generated_text" in resp:
-                return resp["generated_text"]
-            # or {'generated_texts': [...]}
-            if "generated_texts" in resp and isinstance(resp["generated_texts"], list) and resp["generated_texts"]:
-                return resp["generated_texts"][0]
-            # fallback: str(resp)
-            return str(resp)
-        # If it's a list of dicts
-        if isinstance(resp, list) and len(resp) > 0:
-            first = resp[0]
-            if isinstance(first, dict) and "generated_text" in first:
-                return first["generated_text"]
-            return str(first)
-        # otherwise fallback to string cast
-        return str(resp)
+        r = requests.head(url, headers=headers, timeout=timeout)
+        if r.status_code == 200:
+            return True
+        if r.status_code in (401, 403, 404):
+            return False
+        r2 = requests.get(url, headers=headers, timeout=timeout)
+        return r2.status_code == 200
     except Exception:
-        traceback.print_exc()
-        return str(resp)
+        return False
 
-class RAGWrapperInference:
+def build_prompt_with_context(query: str, docs: list) -> str:
     """
-    Simple RAG wrapper that:
-     - retrieves relevant docs via vectorstore retriever (if available)
-     - constructs a prompt with context + question
-     - calls huggingface_hub.InferenceClient.text_generation
+    Build a simple RAG prompt:
+      - include retrieved docs as 'Context' (shorten if necessary)
+      - then ask the question.
     """
-    def __init__(self, vectorstore, hf_client: InferenceClient, max_context_chars: int = 7000):
-        self.vs = vectorstore
-        self.client = hf_client
-        self.max_context_chars = max_context_chars
+    ctx_items = []
+    for d in docs:
+        # LangChain Document object often has .page_content
+        if hasattr(d, "page_content"):
+            ctx_items.append(d.page_content.strip())
+        elif isinstance(d, dict) and "page_content" in d:
+            ctx_items.append(str(d["page_content"]).strip())
+        else:
+            ctx_items.append(str(d).strip())
+    context = "\n\n---\n\n".join(ctx_items) if ctx_items else ""
+    prompt = "Use the following context to answer the question concisely.\n\n"
+    if context:
+        prompt += f"CONTEXT:\n{context}\n\n"
+    prompt += f"QUESTION:\n{query}\n\nAnswer:"
+    return prompt
 
-    def _retrieve_context(self, query: str, top_k: int = 4) -> str:
-        # Try as_retriever API
-        try:
-            if hasattr(self.vs, "as_retriever"):
-                retr = self.vs.as_retriever()
-                # many retrievers expect .get_relevant_documents
-                if hasattr(retr, "get_relevant_documents"):
-                    docs = retr.get_relevant_documents(query)
-                elif hasattr(retr, "get_relevant_items"):
-                    docs = retr.get_relevant_items(query)
-                else:
-                    docs = []
-            elif hasattr(self.vs, "similarity_search"):
-                docs = self.vs.similarity_search(query, k=top_k)
-            else:
-                docs = []
-            # Normalize content
-            contents = []
-            for d in (docs or []):
-                try:
-                    c = getattr(d, "page_content", None) or d.get("page_content") if isinstance(d, dict) else str(d)
-                except Exception:
-                    c = str(d)
-                if c:
-                    contents.append(c)
-            ctx = "\n\n".join(contents[:top_k])
-            # trim to max_context_chars (keep the end)
-            if len(ctx) > self.max_context_chars:
-                ctx = ctx[-self.max_context_chars:]
-            return ctx
-        except Exception:
-            traceback.print_exc()
-            return ""
+# ---------------- LLM via InferenceClient (no LangChain LLM wrapper) ----------------
 
-    def run(self, query: str) -> str:
-        context = self._retrieve_context(query)
-        # Build prompt. Use a clear instruction.
-        prompt = (
-            "You are an assistant answering cybersecurity questions using the provided context.\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {query}\n\nAnswer concisely and clearly:"
-        )
-        try:
-            # Call InferenceClient.text_generation (may return dict/list)
-            resp = self.client.text_generation(prompt, max_new_tokens=512)
-            out = extract_text_from_inference_response(resp)
-            return out
-        except Exception:
-            # try a lower-level call (some hf-hub versions have .pipeline or .generate)
-            traceback.print_exc()
-            try:
-                resp2 = self.client.generate(prompt, max_new_tokens=512)  # older/newer fallback
-                return extract_text_from_inference_response(resp2)
-            except Exception:
-                traceback.print_exc()
-                raise
-
-# -------------------------
-# Try initialize HF Inference client + RAG
-# This will be called from lifespan below (defensive)
-# -------------------------
-def try_init_inference_rag(vs) -> Optional[RAGWrapperInference]:
-    if vs is None:
-        print("[LLM] Vector store missing; cannot initialize RAG.")
-        return None
+def try_init_inference_client(vs):
+    """Try primary then fallback. Returns (client, model_id) or (None, None)."""
+    if InferenceClient is None:
+        print("[LLM] huggingface_hub.InferenceClient not available.")
+        return None, None
     if not HF_TOKEN:
-        print("[LLM] HF token not set; cannot initialize RAG.")
-        return None
+        print("[LLM] HF token not set - cannot create InferenceClient.")
+        return None, None
 
-    # Try primary model via InferenceClient
+    # 1) Primary
+    print(f"[LLM] checking inference availability for primary model: {PRIMARY_REPO_ID}")
+    if check_inference_endpoint(PRIMARY_REPO_ID, HF_TOKEN):
+        try:
+            client = InferenceClient(model=PRIMARY_REPO_ID, token=HF_TOKEN)
+            print(f"[LLM] Created InferenceClient for {PRIMARY_REPO_ID}")
+            return client, PRIMARY_REPO_ID
+        except Exception:
+            traceback.print_exc()
+            print("[LLM] failed to create InferenceClient for primary model.")
+
+    # 2) fallback
+    print(f"[LLM] trying fallback model: {FALLBACK_REPO_ID}")
+    if check_inference_endpoint(FALLBACK_REPO_ID, HF_TOKEN):
+        try:
+            client = InferenceClient(model=FALLBACK_REPO_ID, token=HF_TOKEN)
+            print(f"[LLM] Created InferenceClient for {FALLBACK_REPO_ID}")
+            return client, FALLBACK_REPO_ID
+        except Exception:
+            traceback.print_exc()
+            print("[LLM] failed to create InferenceClient for fallback model.")
+
+    print("[LLM] No inference model available via HF Inference API.")
+    return None, None
+
+def generate_with_inference(client: InferenceClient, model_id: str, retriever, query: str, top_k: int = TOP_K, max_new_tokens: int = 256):
+    """
+    Retrieve top-k docs and call InferenceClient.text_generation.
+    Returns the generated text (string) or raises an exception.
+    """
+    if client is None:
+        raise RuntimeError("Inference client not initialized.")
+    # get top-k docs using common LangChain retriever API
+    docs = []
     try:
-        print(f"[LLM] Creating InferenceClient for model: {PRIMARY_REPO_ID}")
-        client = InferenceClient(model=PRIMARY_REPO_ID, token=HF_TOKEN)
-        wrapper = RAGWrapperInference(vs, client)
-        print("[LLM] InferenceClient created for PRIMARY_REPO_ID.")
-        ml_models["hf_inference_client"] = client
-        return wrapper
+        # as_retriever() returns a Retriever with get_relevant_documents()
+        retr = retriever if hasattr(retriever, "get_relevant_documents") else (retriever.as_retriever() if hasattr(retriever, "as_retriever") else None)
+        if retr is None:
+            # try simple vs.get for docs
+            try:
+                res = retriever.get()
+                docs = res.get("documents", []) if isinstance(res, dict) else []
+            except Exception:
+                docs = []
+        else:
+            docs = retr.get_relevant_documents(query) if hasattr(retr, "get_relevant_documents") else retr.get_documents(query)
     except Exception:
         traceback.print_exc()
+        docs = []
 
-    # Try fallback small model
+    # take top_k docs if retr returned a longer list
+    docs = docs[:top_k] if docs else []
+
+    prompt = build_prompt_with_context(query, docs)
+    # call the inference API's text_generation
+    # the InferenceClient.text_generation returns different shapes across versions; handle robustly.
     try:
-        print(f"[LLM] Attempting fallback InferenceClient for model: {FALLBACK_SMALL_REPO_ID}")
-        client2 = InferenceClient(model=FALLBACK_SMALL_REPO_ID, token=HF_TOKEN)
-        wrapper2 = RAGWrapperInference(vs, client2)
-        ml_models["hf_inference_client"] = client2
-        print("[LLM] InferenceClient created for FALLBACK_SMALL_REPO_ID.")
-        return wrapper2
+        # prefer explicit parameters if client supports them
+        gen = client.text_generation(prompt, max_new_tokens=max_new_tokens)
+    except Exception as e:
+        # sometimes method name or signature differ; try the generic client (post to inference endpoint)
+        try:
+            # fallback to raw requests to inference endpoint
+            url = f"https://api-inference.huggingface.co/models/{model_id}"
+            headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+            payload = {"inputs": prompt, "parameters": {"max_new_tokens": max_new_tokens}}
+            r = requests.post(url, headers=headers, json=payload, timeout=60)
+            r.raise_for_status()
+            gen = r.json()
+        except Exception:
+            raise
+
+    # parse gen -> string
+    try:
+        # If InferenceClient returns a list of dicts
+        if isinstance(gen, list):
+            # common shape: [{"generated_text": "..."}]
+            first = gen[0]
+            if isinstance(first, dict):
+                return first.get("generated_text") or first.get("generated_texts") or str(first)
+            else:
+                return str(first)
+        if isinstance(gen, dict):
+            # sometimes {'generated_text': '...'}
+            if "generated_text" in gen:
+                return gen["generated_text"]
+            # InferenceClient objects may contain top-level 'generated_text' or nested
+            # Or huggingface_hub InferenceClient returns a "InferenceResponse" object that has .generated_text
+            if hasattr(gen, "get"):
+                # best-effort
+                for k in ("generated_text", "text", "output", "result"):
+                    if k in gen:
+                        return gen[k]
+            # fallback
+            return str(gen)
+        # object with attribute
+        if hasattr(gen, "generated_text"):
+            return getattr(gen, "generated_text")
+        # else convert to str
+        return str(gen)
     except Exception:
         traceback.print_exc()
+        return str(gen)
 
-    return None
+# ---------------- FastAPI lifecycle ----------------
 
-# -------------------------
-# FastAPI lifespan
-# -------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[LIFESPAN] starting up...")
-    # embeddings
+    # embedding
     ml_models["embedding_function"] = create_embedding_function()
     # chroma
     ml_models["vector_store"] = init_chroma(ml_models["embedding_function"])
     vs = ml_models["vector_store"]
     print(f"[LIFESPAN] vector_store object: {type(vs).__name__ if vs is not None else None}")
 
-    # find CSV (includes the hardcoded path you provided)
+    # locate CSV
     csv_path = find_csv_path()
-    if csv_path is None:
-        print("[LIFESPAN] No sampled CSV found automatically. Use /upload-csv or place CSV at the reported path and call /force-ingest.")
-    else:
+    if csv_path:
         print(f"[LIFESPAN] Found CSV at: {csv_path}")
+    else:
+        print("[LIFESPAN] No sampled CSV found automatically. Use /upload-csv or place CSV at the reported path and call /force-ingest.")
 
     # ingest automatically if vector store empty and CSV found
     if vs is not None:
@@ -443,25 +441,17 @@ async def lifespan(app: FastAPI):
     else:
         print("[LIFESPAN] No vector store; skipping ingestion.")
 
-    # init HF InferenceClient + RAG wrapper
-    ml_models["rag_chain"] = None
-    if ml_models.get("vector_store") is not None and HF_TOKEN:
-        rag = try_init_inference_rag(ml_models["vector_store"])
-        if rag:
-            ml_models["rag_chain"] = rag
-            print("[LIFESPAN] RAG chain (InferenceClient-based) initialized.")
-        else:
-            print("[LIFESPAN] RAG chain initialization failed.")
+    # init inference client (primary -> fallback)
+    ml_models["hf_inference_client"], ml_models["hf_model_id"] = try_init_inference_client(vs)
+    if ml_models["hf_inference_client"] is not None:
+        print(f"[LIFESPAN] Inference client ready for model: {ml_models['hf_model_id']}")
     else:
-        if not HF_TOKEN:
-            print("[LIFESPAN] HF token not set; skipping LLM init.")
-        else:
-            print("[LIFESPAN] vector_store missing; skipping LLM init.")
+        print("[LIFESPAN] Inference client not initialized; /generate-text will be unavailable.")
 
     print("[LIFESPAN] startup complete:", {
-        "vector_store_ready": ml_models.get("vector_store") is not None,
-        "vector_store_count": vs_count_estimate(ml_models.get("vector_store")) if ml_models.get("vector_store") is not None else 0,
-        "rag_chain_ready": ml_models.get("rag_chain") is not None,
+        "vector_store_ready": vs is not None,
+        "vector_store_count": vs_count_estimate(vs) if vs is not None else 0,
+        "rag_chain_ready": ml_models["hf_inference_client"] is not None,
         "hf_token_set": bool(HF_TOKEN),
         "csv_found": bool(csv_path)
     })
@@ -469,9 +459,6 @@ async def lifespan(app: FastAPI):
     ml_models.clear()
     print("[LIFESPAN] shutdown complete.")
 
-# -------------------------
-# FastAPI app & endpoints
-# -------------------------
 app = FastAPI(lifespan=lifespan)
 
 class QueryRequest(BaseModel):
@@ -501,14 +488,14 @@ def status():
         "vector_store_ready": vs is not None,
         "vector_store_has_data": has_data,
         "vector_store_count": int(count),
-        "rag_chain_ready": ml_models.get("rag_chain") is not None,
+        "inference_client_ready": ml_models.get("hf_inference_client") is not None,
+        "hf_model_id": ml_models.get("hf_model_id"),
         "hf_token_set": bool(HF_TOKEN),
         "csv_found": bool(find_csv_path())
     }
 
 @app.post("/upload-csv")
 async def upload_csv(file: UploadFile = File(...), save_name: Optional[str] = Form(None)):
-    """Upload CSV to documents/ (useful if the CSV is not already placed)."""
     try:
         os.makedirs(DOCUMENTS_DIR, exist_ok=True)
         filename = save_name or file.filename or DEFAULT_CSV_BASENAME
@@ -523,11 +510,6 @@ async def upload_csv(file: UploadFile = File(...), save_name: Optional[str] = Fo
 
 @app.post("/force-ingest")
 def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
-    """
-    Force ingestion of the CSV into the vector store.
-    - sample_limit: optional int to ingest only first N rows (useful for testing)
-    - batch_size: number of docs per add_texts() call
-    """
     vs = ml_models.get("vector_store")
     if vs is None:
         raise HTTPException(status_code=503, detail="Vector store not available.")
@@ -547,29 +529,32 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
 
 @app.post("/generate-text", response_model=QueryResponse)
 def generate_text(req: QueryRequest):
-    if ml_models.get("rag_chain") is None:
-        raise HTTPException(status_code=503, detail="RAG chain not available.")
+    client = ml_models.get("hf_inference_client")
+    model_id = ml_models.get("hf_model_id")
+    vs = ml_models.get("vector_store")
+    if client is None or model_id is None:
+        raise HTTPException(status_code=503, detail="Inference client (RAG) not available. Check HF token and model availability.")
+    if vs is None:
+        raise HTTPException(status_code=503, detail="Vector store not available.")
     if not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
     try:
-        rag = ml_models["rag_chain"]
-        # Preferred interface: run(query)
-        if hasattr(rag, "run"):
-            out = rag.run(req.query)
-        else:
-            # last-resort try different interfaces
-            try:
-                if hasattr(rag, "invoke"):
-                    res = rag.invoke({"query": req.query})
-                    out = res.get("result") if isinstance(res, dict) else res
-                elif callable(rag):
-                    out = rag(req.query)
-                else:
-                    raise RuntimeError("RAG object has no runnable interface")
-            except Exception:
-                traceback.print_exc()
-                raise
-        return QueryResponse(answer=str(out) if out is not None else "No answer generated.")
+        # try to get a retriever; many Chroma wrappers implement as_retriever()
+        retriever = None
+        try:
+            retriever = vs.as_retriever()
+        except Exception:
+            retriever = vs  # our generate_with_inference handles different shapes
+
+        answer = generate_with_inference(client, model_id, retriever, req.query, top_k=TOP_K, max_new_tokens=256)
+        return QueryResponse(answer=str(answer))
+    except requests.HTTPError as http_e:
+        # surface HF inference HTTP errors (401/403/404)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Generation failed: {http_e}")
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+
+if __name__ == "__main__":
+    print("Run uvicorn textgen_service.main:app --host 0.0.0.0 --port 8002")
