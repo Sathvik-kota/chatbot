@@ -1,16 +1,97 @@
-# frontend/app.py
 import streamlit as st
 import requests
 from io import BytesIO
 from PIL import Image
 
-st.set_page_config(page_title="🧠 SecureWatch Multimodal Dashboard", layout="wide")
+st.set_page_config(page_title="🤖 MicroChaTBoT - SecureWatch", layout="wide")
 
-st.title("🧠 SecureWatch Multimodal Dashboard")
-st.markdown("Use the sidebar to pick a feature. The app calls backend FastAPI services running on the same machine (localhost).")
+# --- Custom CSS for a professional look ---
+st.markdown("""
+<style>
+/* Main app styling */
+.main {
+    background-color: #f0f2f6; /* Light gray background */
+}
+
+/* Title */
+h1 {
+    color: #1a1a68; /* Deep blue */
+    font-family: 'Arial Black', sans-serif;
+    text-align: center;
+}
+
+/* Subheader */
+h2, .st-emotion-cache-1j90idx {
+    color: #333;
+    font-family: 'Arial', sans-serif;
+    text-align: center;
+}
+
+/* Sidebar styling */
+.stSidebar {
+    background-color: #ffffff;
+    border-right: 2px solid #e0e0e0;
+}
+
+/* Buttons */
+.stButton>button {
+    background-color: #1a1a68; /* Deep blue */
+    color: white;
+    border: none;
+    border-radius: 8px;
+    padding: 10px 20px;
+    font-weight: bold;
+    width: 100%;
+    transition: background-color 0.3s ease;
+}
+.stButton>button:hover {
+    background-color: #3e3e8f; /* Lighter blue on hover */
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+}
+.stButton>button:active {
+    background-color: #10104a; /* Darker blue on click */
+}
+
+/* Text area & inputs */
+.stTextArea textarea, .stTextInput input {
+    border: 2px solid #e0e0e0;
+    border-radius: 8px;
+    background-color: #ffffff;
+}
+.stTextArea textarea:focus, .stTextInput input:focus {
+    border-color: #1a1a68;
+    box-shadow: 0 0 0 2px #3e3e8f30;
+}
+
+/* Info/Success/Error boxes */
+.stSuccess {
+    background-color: #e6f7ff;
+    border: 1px solid #b3e0ff;
+    border-radius: 8px;
+    color: #0056b3;
+}
+.stError {
+    background-color: #ffe6e6;
+    border: 1px solid #ffb3b3;
+    border-radius: 8px;
+    color: #b30000;
+}
+.stWarning {
+    background-color: #fffbe6;
+    border: 1px solid #ffe58f;
+    border-radius: 8px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# --- Main Title ---
+st.title("🤖 MicroChaTBoT")
+st.subheader("SecureWatch Multimodal Dashboard")
+st.markdown("<p style='text-align: center;'>Use the sidebar to pick a feature. The app calls backend FastAPI services.</p>", unsafe_allow_html=True)
+
 
 # --- Backend base URLs (editable in sidebar) ---
-st.sidebar.header("Backend configuration")
+st.sidebar.header("Backend Configuration")
 host = st.sidebar.text_input("Backend host", value="http://localhost")
 sentiment_port = st.sidebar.text_input("Sentiment port", value="8001")
 textgen_port = st.sidebar.text_input("TextGen port", value="8002")
@@ -23,15 +104,43 @@ BASE_IMGEN = f"{host}:{imggen_port}"
 BASE_SEG = f"{host}:{seg_port}"
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("Example: If you run services in Colab, keep host as http://localhost (Streamlit server makes server-side requests).")
+st.sidebar.markdown("Running services in a container or Colab? Keep host as `http://localhost` if Streamlit is running on the same machine/network.")
 
 # --- Feature selector ---
-feature = st.sidebar.selectbox("Select a Feature", ["Sentiment Analysis", "RAG / Text Generation", "Text → Image", "Text-based Segmentation"])
+feature = st.sidebar.selectbox("Select a Feature", ["Chat with MicroChaTBoT", "Sentiment Analysis", "Text → Image", "Text-based Segmentation"])
+
+# --- RAG / Text Generation (Renamed to MicroChaTBoT) ---
+if feature == "Chat with MicroChaTBoT":
+    st.header("💬 Chat with MicroChaTBoT (RAG)")
+    st.markdown("<p style='text-align: center;'>Ask a question about your cybersecurity data or general knowledge.</p>", unsafe_allow_html=True)
+    
+    query = st.text_area("Your Question:", height=150, placeholder="e.g., What is a SYN flood attack?  OR  What was the response for the DDoS attack?")
+    
+    if st.button("Generate Answer"):
+        if not query.strip():
+            st.warning("Please enter a question first.")
+        else:
+            try:
+                with st.spinner("MicroChaTBoT is thinking..."):
+                    # *** FIXED: Increased timeout from 60 to 180 seconds ***
+                    resp = requests.post(f"{BASE_TEXTGEN}/generate-text", json={"query": query}, timeout=180)
+                
+                if resp.status_code == 200:
+                    answer = resp.json().get("answer") or resp.json().get("result") or resp.text
+                    st.markdown("### 🤖 MicroChaTBoT's Answer:")
+                    st.info(answer)
+                else:
+                    st.error(f"Service error: {resp.status_code} - {resp.text}")
+            except Exception as e:
+                st.error(f"Request failed: {e}")
 
 # --- Sentiment Analysis ---
-if feature == "Sentiment Analysis":
+elif feature == "Sentiment Analysis":
     st.header("📝 Sentiment Analysis")
-    text = st.text_area("Enter text to analyze", height=150)
+    st.markdown("<p style='text-align: center;'>Analyze the sentiment of a piece of text.</p>", unsafe_allow_html=True)
+    
+    text = st.text_area("Enter text to analyze:", height=150, placeholder="e.g., 'The system is down again, this is frustrating.'")
+    
     if st.button("Analyze Sentiment"):
         if not text.strip():
             st.warning("Enter some text first.")
@@ -41,30 +150,9 @@ if feature == "Sentiment Analysis":
                     resp = requests.post(f"{BASE_SENTIMENT}/predict", json={"text": text}, timeout=30)
                 if resp.status_code == 200:
                     j = resp.json()
-                    st.success(f"Sentiment: **{j.get('sentiment')}** (score: {j.get('score', j.get('confidence', 'n/a'))})")
+                    st.success(f"Sentiment: **{j.get('sentiment')}** (Score: {j.get('score', j.get('confidence', 'n/a'))})")
                     if "probabilities" in j:
                         st.json(j["probabilities"])
-                else:
-                    st.error(f"Service error: {resp.status_code} - {resp.text}")
-            except Exception as e:
-                st.error(f"Request failed: {e}")
-
-# --- RAG / Text Generation ---
-elif feature == "RAG / Text Generation":
-    st.header("🧾 RAG / Text Generation")
-    query = st.text_area("Ask a question (RAG):", height=150, placeholder="e.g., How to detect SSH brute force attacks?")
-    if st.button("Generate Answer"):
-        if not query.strip():
-            st.warning("Enter a question first.")
-        else:
-            try:
-                with st.spinner("Generating..."):
-                    # *** FIXED: Increased timeout from 60 to 180 seconds ***
-                    resp = requests.post(f"{BASE_TEXTGEN}/generate-text", json={"query": query}, timeout=180)
-                if resp.status_code == 200:
-                    answer = resp.json().get("answer") or resp.json().get("result") or resp.text
-                    st.markdown("**Answer:**")
-                    st.write(answer)
                 else:
                     st.error(f"Service error: {resp.status_code} - {resp.text}")
             except Exception as e:
@@ -73,8 +161,10 @@ elif feature == "RAG / Text Generation":
 # --- Text -> Image Generation ---
 elif feature == "Text → Image":
     st.header("🖼️ Text → Image Generation")
+    st.markdown("<p style='text-align: center;'>Generate an image from a text prompt.</p>", unsafe_allow_html=True)
+    
     prompt = st.text_area("Enter an image prompt:", height=150, placeholder="e.g., A futuristic SOC dashboard, photorealistic")
-    max_preview = st.slider("Preview width (px)", 200, 1200, 600)
+    
     if st.button("Generate Image"):
         if not prompt.strip():
             st.warning("Enter a prompt first.")
@@ -84,7 +174,7 @@ elif feature == "Text → Image":
                     resp = requests.post(f"{BASE_IMGEN}/generate-image", json={"prompt": prompt}, timeout=120)
                 if resp.status_code == 200:
                     img = Image.open(BytesIO(resp.content))
-                    st.image(img, caption="Generated image", use_column_width=True, width=max_preview)
+                    st.image(img, caption="Generated image", use_column_width=True)
                     # offer download
                     buf = BytesIO()
                     img.save(buf, format="PNG")
@@ -97,10 +187,12 @@ elif feature == "Text → Image":
 
 # --- Text-based Segmentation ---
 elif feature == "Text-based Segmentation":
-    st.header("🔍 Text-based Image Segmentation (fallback)")
+    st.header("🔍 Text-based Image Segmentation")
+    st.markdown("<p style='text-align: center;'>Upload an image and identify objects to segment.</p>", unsafe_allow_html=True)
+
     uploaded = st.file_uploader("Upload an image", accept_multiple_files=False, type=["png", "jpg", "jpeg"])
-    seg_prompt = st.text_input("What to segment? (short text prompt)", placeholder="e.g., person, car, dog")
-    cluster_k = st.slider("Mask overlay opacity (%)", 10, 100, 60)
+    seg_prompt = st.text_input("What to segment?", placeholder="e.g., person, car, dog")
+    
     if st.button("Segment Image"):
         if uploaded is None:
             st.warning("Upload an image first.")
@@ -128,5 +220,5 @@ elif feature == "Text-based Segmentation":
 
 # Footer
 st.markdown("---")
-st.markdown("Made with ❤️ — calls backend FastAPI services on the server (localhost).")
+st.markdown("<p style='text-align: center; color: #555;'>Made with ❤️ — calls backend FastAPI services on the server (localhost).</p>", unsafe_allow_html=True)
 
