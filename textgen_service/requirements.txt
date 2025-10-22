@@ -1,7 +1,6 @@
 # Web / API
-fastapi==0.95.2
-uvicorn[standard]==0.22.0
-
+fastapi
+uvicorn[standard]
 # Data
 pandas==2.1.1
 
@@ -16,7 +15,7 @@ transformers==4.35.0
 # torch==2.8.0+cu126
 
 # LangChain ecosystem
-langchain==0.3.27
+langchain
 langchain-text-splitters==0.3.11
 langchain-huggingface==0.1.0
 
