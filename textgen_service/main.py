@@ -65,7 +65,7 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 # Use a SMALL local model that works well for Q&A
 LOCAL_MODEL_ID = "google/flan-t5-base"  # Using base for better quality
 
-TOP_K = 1
+TOP_K = 1 # Use only the single best match
 
 # ---------------- Globals ----------------
 ml_models = {
@@ -200,7 +200,45 @@ def _try_add_texts(vs, texts):
 def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
     if df is None or vs is None:
         return False, "no_df_or_vs"
-    docs = df.fillna("").apply(lambda r: " | ".join([f"{c}: {r[c]}" for c in df.columns]), axis=1).tolist()
+
+    # --- NEW LOGIC: Selectively ingest text-rich columns ---
+    
+    # Define columns that likely contain useful, descriptive text. Case-insensitive.
+    USEFUL_COLUMNS = [
+        "description", "summary", "attack type", "payload",
+        "attack signature", "text", "alert description", "details",
+        "Attack Type" # Add specific casing from user's logs
+    ]
+    
+    # Get lowercased versions of actual columns
+    df_cols_lower = {col.lower(): col for col in df.columns}
+    
+    # Find the original-cased column names that match our useful list
+    cols_to_use = [df_cols_lower[col_name] for col_name in USEFUL_COLUMNS if col_name in df_cols_lower]
+
+    docs = []
+    if cols_to_use:
+        print(f"[INGEST] Found useful text columns: {cols_to_use}")
+        # Create a "document" by joining just these columns, adding the column name as context
+        # e.g., "Attack Type: DDoS. Description: A SYN flood..."
+        def create_doc(row):
+            return ". ".join([f"{col}: {row[col]}" for col in cols_to_use if pd.notna(row[col]) and row[col]])
+        
+        docs = df.apply(create_doc, axis=1).tolist()
+        
+    else:
+        # Fallback to old (noisy) method with a clear warning
+        print("[INGEST] WARNING: No specific text columns found (e.g., 'Description', 'Summary', 'Attack Type').")
+        print("[INGEST] Falling back to ingesting ALL columns. This may lead to irrelevant/noisy answers.")
+        docs = df.fillna("").apply(lambda r: " | ".join([f"{c}: {r[c]}" for c in df.columns]), axis=1).tolist()
+    
+    # Filter out any empty documents that might have been created
+    docs = [d for d in docs if d.strip()]
+    if not docs:
+        print("[INGEST] ERROR: No documents were created from the DataFrame.")
+        return False, "no_documents_created"
+    # --- END NEW LOGIC ---
+
     total_added = 0
     for i in range(0, len(docs), batch_docs):
         batch = docs[i:i+batch_docs]
@@ -208,12 +246,14 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
         if not ok:
             return False, f"batch_failed_at_{i}"
         total_added += len(batch)
+    
     try:
         if hasattr(vs, "persist"):
             vs.persist()
     except Exception:
         traceback.print_exc()
     return True, {"method": method, "docs_added": total_added}
+
 
 def create_local_llm():
     """Create a local HuggingFace Pipeline model with optimal generation settings"""
@@ -223,13 +263,13 @@ def create_local_llm():
     if pipeline is None or AutoTokenizer is None or AutoModelForSeq2SeqLM is None:
         print("[LLM] transformers library not available.")
         return None
-
+    
     try:
         print(f"[LLM] Loading local model: {LOCAL_MODEL_ID}")
-
+        
         # Load tokenizer and model
         tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_ID)
-
+        
         # For T5/Flan-T5 models (seq2seq)
         if "t5" in LOCAL_MODEL_ID.lower():
             model = AutoModelForSeq2SeqLM.from_pretrained(LOCAL_MODEL_ID)
@@ -238,7 +278,7 @@ def create_local_llm():
             # For causal LM models
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text-generation"
-
+        
         # Create pipeline with OPTIMIZED generation parameters
         pipe = pipeline(
             task,
@@ -253,13 +293,13 @@ def create_local_llm():
             no_repeat_ngram_size=3,
             early_stopping=True
         )
-
+        
         # Wrap in LangChain
         llm = HuggingFacePipeline(pipeline=pipe)
-
+        
         print(f"[LLM] Local model loaded successfully: {LOCAL_MODEL_ID}")
         return llm
-
+        
     except Exception as e:
         print(f"[LLM] Failed to load local model: {e}")
         traceback.print_exc()
@@ -270,11 +310,11 @@ def create_rag_chain(llm, vs):
     if llm is None or vs is None:
         print("[RAG] Cannot create chain: llm or vs is None")
         return None
-
+    
     if RetrievalQA is None:
         print("[RAG] RetrievalQA not available")
         return None
-
+    
     try:
         # *** FIXED: This new prompt allows the model to ignore irrelevant context ***
         template = """Use the following context ONLY if it is relevant to the question.
@@ -285,7 +325,7 @@ Context: {context}
 Question: {question}
 
 Answer:"""
-
+        
         prompt = None
         if PromptTemplate is not None:
             try:
@@ -293,12 +333,12 @@ Answer:"""
                 print("[RAG] Created simple prompt template")
             except Exception:
                 traceback.print_exc()
-
+        
         # Create RAG chain
         chain_type_kwargs = {}
         if prompt is not None:
             chain_type_kwargs["prompt"] = prompt
-
+        
         rag = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
@@ -306,10 +346,10 @@ Answer:"""
             chain_type_kwargs=chain_type_kwargs,
             return_source_documents=False
         )
-
+        
         print("[RAG] RAG chain created successfully")
         return rag
-
+        
     except Exception as e:
         print(f"[RAG] Failed to create chain: {e}")
         traceback.print_exc()
@@ -318,10 +358,10 @@ Answer:"""
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[LIFESPAN] starting up...")
-
+    
     # Embedding
     ml_models["embedding_function"] = create_embedding_function()
-
+    
     # Chroma
     ml_models["vector_store"] = init_chroma(ml_models["embedding_function"])
     vs = ml_models["vector_store"]
@@ -352,11 +392,11 @@ async def lifespan(app: FastAPI):
     # Create local LLM
     print("[LIFESPAN] Loading local LLM (this may take a minute)...")
     ml_models["local_llm"] = create_local_llm()
-
+    
     # Create RAG chain
     if ml_models["local_llm"] is not None and vs is not None:
         ml_models["rag_chain"] = create_rag_chain(ml_models["local_llm"], vs)
-
+    
     print("[LIFESPAN] startup complete:", {
         "vector_store_ready": vs is not None,
         "vector_store_count": vs_count_estimate(vs) if vs is not None else 0,
@@ -364,7 +404,7 @@ async def lifespan(app: FastAPI):
         "rag_chain_ready": ml_models.get("rag_chain") is not None,
         "csv_found": bool(csv_path)
     })
-
+    
     yield
     ml_models.clear()
     print("[LIFESPAN] shutdown complete.")
@@ -422,9 +462,24 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
         raise HTTPException(status_code=400, detail="CSV empty or unreadable.")
     if sample_limit is not None:
         df = df.head(sample_limit)
+    
+    # --- Clear the old (noisy) data first ---
+    try:
+        print("[INGEST] Clearing old data from vector store...")
+        if hasattr(vs, "_collection"):
+            vs._collection.delete(ids=vs._collection.get()['ids'])
+            print("[INGEST] Old data cleared.")
+        else:
+            print("[INGEST] Could not automatically clear old data. Re-ingesting anyway.")
+    except Exception as e:
+        print(f"[INGEST] Error clearing old data: {e}. Continuing...")
+        traceback.print_exc()
+
+    # --- Ingest the new (clean) data ---
     ok, info = ingest_dataframe(df, vs, batch_docs=batch_size)
     if not ok:
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {info}")
+    
     final_count = vs_count_estimate(vs)
     return {"status": "ingested", "method_info": info, "final_count": int(final_count)}
 
@@ -432,11 +487,11 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
 def generate_text(req: QueryRequest):
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
-
+    
     rag = ml_models.get("rag_chain")
     if rag is None:
         raise HTTPException(status_code=503, detail="RAG chain not available. Model may still be loading.")
-
+    
     try:
         # Try different invocation methods
         if hasattr(rag, "run"):
