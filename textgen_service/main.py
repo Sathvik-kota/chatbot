@@ -286,18 +286,16 @@ def create_local_llm():
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text-generation"
         
-        # Create pipeline with OPTIMIZED generation parameters
+        # --- *** SIMPLIFIED Generation Parameters *** ---
+        # We are removing min_length and other "creative" settings
+        # to make the model more factual and less likely to hallucinate.
         pipe = pipeline(
             task,
             model=model,
             tokenizer=tokenizer,
-            max_length=512,  # Total max length
-            min_length=40,  # Minimum length
-            do_sample=True,
+            max_new_tokens=256, # Changed from max_length
             temperature=0.7,
             top_p=0.9,
-            repetition_penalty=1.15,
-            no_repeat_ngram_size=3,
             early_stopping=True
         )
         
@@ -323,9 +321,11 @@ def create_rag_chain(llm, vs):
         return None
     
     try:
-        # *** FIXED: This new prompt allows the model to ignore irrelevant context ***
-        template = """Use the following context ONLY if it is relevant to the question.
-If the context is not relevant, answer the question using your own knowledge about cybersecurity.
+        # --- *** SIMPLIFIED PROMPT *** ---
+        # This is a much more direct, simple prompt that flan-t5
+        # is more likely to follow correctly.
+        template = """Answer the following question based on the context provided.
+If the context is not relevant, answer from your own knowledge.
 
 Context: {context}
 
