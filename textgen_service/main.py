@@ -483,6 +483,18 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
     final_count = vs_count_estimate(vs)
     return {"status": "ingested", "method_info": info, "final_count": int(final_count)}
 
+# --- NEW DEBUG ENDPOINT ---
+@app.get("/get-csv-columns")
+def get_csv_columns():
+    csv_path = find_csv_path()
+    if csv_path is None:
+        raise HTTPException(status_code=404, detail="CSV not found.")
+    df = load_dataframe_from_csv(csv_path)
+    if df is None:
+        raise HTTPException(status_code=400, detail="CSV empty or unreadable.")
+    return {"columns": list(df.columns)}
+# --- END NEW ENDPOINT ---
+
 @app.post("/generate-text", response_model=QueryResponse)
 def generate_text(req: QueryRequest):
     if not req.query or not req.query.strip():
