@@ -95,9 +95,9 @@ HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
 PRIMARY_REPO_ID = "mistralai/Mixtral-8x7B-Instruct-v0.1"    # may be gated / not hosted for inference
 # *** UPDATED FALLBACK_REPO_ID ***
-# The Flan-T5 models are consistently 404.
-# Switching to a different, widely available instruction-tuned model.
-FALLBACK_REPO_ID = "tiiuae/falcon-7b-instruct"
+# All instruction-tuned models (flan, falcon) are 404.
+# We MUST go back to the only model that was available.
+FALLBACK_REPO_ID = "google-t5/t5-small"
 
 TOP_K = 4
 
@@ -286,17 +286,11 @@ def build_prompt_with_context(query: str, docs: list, model_id: str = "") -> str
     # --- UPDATED: Select prompt format based on model ---
     # T5 models prefer a "task" format
     if "t5" in model_id.lower():
-        # --- UPDATED: Use a very explicit Q&A instruction format ---
-        return f"""Answer the following question based on the context provided.
+        # --- UPDATED: Use a summarization-style prefix to force a different task ---
+        # This is a bit of a trick to stop it from just repeating the context.
+        return f"""summarize: {context}
 
-Context:
-{context}
-
-Question:
-{query}
-
-Answer:
-"""
+Given the context above, {query}"""
 
     # Default to instruction format for models like Mixtral
     prompt = "Use the following context to answer the question concisely.\n\n"
@@ -468,21 +462,14 @@ def try_create_langchain_llm_and_rag(vs):
     try:
         # use a small public model as fallback; specify task to satisfy the pydantic validation
         print(f"[LLM] Trying HuggingFaceHub with {FALLBACK_REPO_ID}")
-        # --- UPDATED: Switched task for the new model ---
-        llm = LC_HuggingFaceHub(repo_id=FALLBACK_REPO_ID, task="text-generation", huggingfacehub_api_token=HF_TOKEN, model_kwargs={"temperature":0.3, "max_new_tokens":512})
+        # --- UPDATED: Switched task back to T5's task ---
+        llm = LC_HuggingFaceHub(repo_id=FALLBACK_REPO_ID, task="text2text-generation", huggingfacehub_api_token=HF_TOKEN, model_kwargs={"temperature":0.3, "max_new_tokens":512})
 
-        # --- NEW: Define a custom prompt template for the T5 fallback model ---
-        # This matches the new explicit instruction prompt
-        template = """Answer the following question based on the context provided.
+        # --- UPDATED: Define a new prompt template for the T5 fallback model ---
+        # This matches the new summarization-style prompt
+        template = """summarize: {context}
 
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-"""
+Given the context above, {question}"""
         prompt = None
         if PromptTemplate is not None:
             try:
@@ -679,5 +666,4 @@ def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn textgen_service.main:app --host 0.0.0.0 --port 8002")
-
 
