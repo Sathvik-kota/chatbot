@@ -12,7 +12,9 @@ chromadb==0.4.7
 
 # Embeddings & transformers
 sentence-transformers==2.2.2
-langchain==0.0.350
+langchain-core==0.1.53
+langsmith==0.0.92
+--no-deps langchain==0.0.350
 langchain-text-splitters==0.0.2
 
 # environment helpers
