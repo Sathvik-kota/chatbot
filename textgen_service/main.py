@@ -201,13 +201,20 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
     if df is None or vs is None:
         return False, "no_df_or_vs"
 
-    # --- NEW LOGIC: Selectively ingest text-rich columns ---
+    # --- *** FIXED LOGIC: Using REAL columns from your CSV *** ---
     
     # Define columns that likely contain useful, descriptive text. Case-insensitive.
     USEFUL_COLUMNS = [
-        "description", "summary", "attack type", "payload",
-        "attack signature", "text", "alert description", "details",
-        "Attack Type" # Add specific casing from user's logs
+        "attack type",
+        "attack severity",
+        "threat intelligence",
+        "response action",
+        # Keep these just in case
+        "description", 
+        "summary", 
+        "text", 
+        "alert description", 
+        "details"
     ]
     
     # Get lowercased versions of actual columns
@@ -220,7 +227,7 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
     if cols_to_use:
         print(f"[INGEST] Found useful text columns: {cols_to_use}")
         # Create a "document" by joining just these columns, adding the column name as context
-        # e.g., "Attack Type: DDoS. Description: A SYN flood..."
+        # e.g., "Attack Type: DDoS. Attack Severity: High..."
         def create_doc(row):
             return ". ".join([f"{col}: {row[col]}" for col in cols_to_use if pd.notna(row[col]) and row[col]])
         
@@ -237,7 +244,7 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
     if not docs:
         print("[INGEST] ERROR: No documents were created from the DataFrame.")
         return False, "no_documents_created"
-    # --- END NEW LOGIC ---
+    # --- END FIXED LOGIC ---
 
     total_added = 0
     for i in range(0, len(docs), batch_docs):
