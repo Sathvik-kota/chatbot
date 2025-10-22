@@ -1,21 +1,29 @@
-pydantic==1.10.12
+
+
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+pydantic==2.7.0
+
+
+
+pandas==2.2.0
+
+
+
+langchain==0.2.0
+langchain-core==0.2.0
+langchain-community==0.2.0
+langchain-text-splitters==0.2.0
+
+
+chromadb==0.5.0
+
+
+sentence-transformers==3.0.0
 transformers==4.35.0
 tokenizers==0.14.1
-fastapi==0.95.2
-uvicorn[standard]==0.22.0
+huggingface-hub==0.24.0
 
-# Data
-pandas==2.1.1
 
-# Vector DB
-chromadb==0.4.7
 
-# Embeddings & transformers
-sentence-transformers==2.2.2
-langchain-core==0.1.53
-langsmith==0.0.92
-langchain==0.0.350
-langchain-text-splitters==0.0.2
-
-# environment helpers
 python-dotenv==1.1.1
