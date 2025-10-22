@@ -59,8 +59,8 @@ elif feature == "RAG / Text Generation":
         else:
             try:
                 with st.spinner("Generating..."):
-                    # *** FIXED: Changed endpoint from /generate to /generate-text ***
-                    resp = requests.post(f"{BASE_TEXTGEN}/generate-text", json={"query": query}, timeout=60)
+                    # *** FIXED: Increased timeout from 60 to 180 seconds ***
+                    resp = requests.post(f"{BASE_TEXTGEN}/generate-text", json={"query": query}, timeout=180)
                 if resp.status_code == 200:
                     answer = resp.json().get("answer") or resp.json().get("result") or resp.text
                     st.markdown("**Answer:**")
@@ -129,3 +129,4 @@ elif feature == "Text-based Segmentation":
 # Footer
 st.markdown("---")
 st.markdown("Made with ❤️ — calls backend FastAPI services on the server (localhost).")
+
