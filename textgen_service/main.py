@@ -1,4 +1,3 @@
-# textgen_service/main.py
 """
 Robust RAG service with multi-path LLM support:
 
@@ -84,8 +83,11 @@ DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
-PRIMARY_REPO_ID = "mistralai/Mixtral-8x7B-Instruct-v0.1"   # may be gated / not hosted for inference
-FALLBACK_REPO_ID = "google/flan-t5-small"                # public fallback for testing
+PRIMARY_REPO_ID = "mistralai/Mixtral-8x7B-Instruct-v0.1"    # may be gated / not hosted for inference
+# *** UPDATED FALLBACK_REPO_ID ***
+# Changed from 'google/flan-t5-small' which was causing a 404 error
+# to 'google-t5/t5-small' which is more reliably available.
+FALLBACK_REPO_ID = "google-t5/t5-small"
 
 TOP_K = 4
 
