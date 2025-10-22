@@ -3,7 +3,7 @@ import requests
 from io import BytesIO
 from PIL import Image
 
-st.set_page_config(page_title="🤖 MicroChaTBoT - SecureWatch", layout="wide")
+st.set_page_config(page_title="🤖 MicroChaTBoT - Watch", layout="wide")
 
 # --- Custom CSS for a professional look ---
 st.markdown("""
@@ -20,8 +20,8 @@ h1 {
     text-align: center;
 }
 
-/* Subheader */
-h2, .st-emotion-cache-1j90idx {
+/* Headers (h2) for features */
+h2 {
     color: #333;
     font-family: 'Arial', sans-serif;
     text-align: center;
@@ -86,11 +86,18 @@ h2, .st-emotion-cache-1j90idx {
 
 # --- Main Title ---
 st.title("🤖 MicroChaTBoT")
-st.subheader("SecureWatch Multimodal Dashboard")
-st.markdown("<p style='text-align: center;'>Use the sidebar to pick a feature. The app calls backend FastAPI services.</p>", unsafe_allow_html=True)
+st.markdown("<h3 style='text-align: center; color: #333; font-family: Arial, sans-serif; font-weight: normal; margin-top: -15px;'>Watch Multimodal Dashboard <span style='font-size: 0.9em; color: #555;'>&nbsp;&nbsp;|&nbsp;&nbsp;Use the sidebar to pick a feature.</span></h3>", unsafe_allow_html=True)
 
 
-# --- Backend base URLs (editable in sidebar) ---
+# --- Sidebar ---
+st.sidebar.header("Select a Feature")
+feature = st.sidebar.selectbox(
+    "Select a Feature", 
+    ["Chat with MicroChaTBoT", "Sentiment Analysis", "Text → Image", "Text-based Segmentation"],
+    label_visibility="collapsed"
+)
+
+st.sidebar.markdown("---")
 st.sidebar.header("Backend Configuration")
 host = st.sidebar.text_input("Backend host", value="http://localhost")
 sentiment_port = st.sidebar.text_input("Sentiment port", value="8001")
@@ -105,9 +112,6 @@ BASE_SEG = f"{host}:{seg_port}"
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("Running services in a container or Colab? Keep host as `http://localhost` if Streamlit is running on the same machine/network.")
-
-# --- Feature selector ---
-feature = st.sidebar.selectbox("Select a Feature", ["Chat with MicroChaTBoT", "Sentiment Analysis", "Text → Image", "Text-based Segmentation"])
 
 # --- RAG / Text Generation (Renamed to MicroChaTBoT) ---
 if feature == "Chat with MicroChaTBoT":
