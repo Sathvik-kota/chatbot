@@ -1,6 +1,6 @@
 """
-Robust RAG service with LOCAL MODEL support - FINAL FIXED VERSION
-Simple prompt that actually generates proper answers
+Robust RAG service with LOCAL MODEL support - COMPLETELY FIXED VERSION
+This version properly retrieves context and forces the model to use it
 """
 import os
 import traceback
@@ -65,7 +65,7 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 # Use a SMALL local model that works well for Q&A
 LOCAL_MODEL_ID = "google/flan-t5-base"  # Using base for better quality
 
-TOP_K = 1 # Use only the single best match
+TOP_K = 3  # *** CHANGED: Use top 3 documents for better context ***
 
 # ---------------- Globals ----------------
 ml_models = {
@@ -198,54 +198,57 @@ def _try_add_texts(vs, texts):
     return False, None
 
 def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
+    """
+    *** COMPLETELY REWRITTEN ***
+    This version creates CLEAN, MEANINGFUL documents from ONLY the relevant columns
+    """
     if df is None or vs is None:
         return False, "no_df_or_vs"
 
-    # --- *** FIXED LOGIC: Using REAL columns from your CSV *** ---
-    
-    # Define columns that likely contain useful, descriptive text. Case-insensitive.
+    # --- *** USE ONLY MEANINGFUL TEXT COLUMNS *** ---
+    # These columns contain the actual cybersecurity information
     USEFUL_COLUMNS = [
-        "attack type",
-        "attack severity",
-        "threat intelligence",
-        "response action",
-        # Keep these just in case
-        "description", 
-        "summary", 
-        "text", 
-        "alert description", 
-        "details"
+        "Attack Type",
+        "Attack Severity", 
+        "Threat Intelligence",
+        "Response Action"
     ]
     
     # Get lowercased versions of actual columns
     df_cols_lower = {col.lower(): col for col in df.columns}
     
     # Find the original-cased column names that match our useful list
-    cols_to_use = [df_cols_lower[col_name] for col_name in USEFUL_COLUMNS if col_name in df_cols_lower]
+    cols_to_use = [df_cols_lower[col_name.lower()] for col_name in USEFUL_COLUMNS if col_name.lower() in df_cols_lower]
 
-    docs = []
-    if cols_to_use:
-        print(f"[INGEST] Found useful text columns: {cols_to_use}")
-        # Create a "document" by joining just these columns, adding the column name as context
-        # e.g., "Attack Type: DDoS. Attack Severity: High..."
-        def create_doc(row):
-            return ". ".join([f"{col}: {row[col]}" for col in cols_to_use if pd.notna(row[col]) and row[col]])
-        
-        docs = df.apply(create_doc, axis=1).tolist()
-        
-    else:
-        # Fallback to old (noisy) method with a clear warning
-        print("[INGEST] WARNING: No specific text columns found (e.g., 'Description', 'Summary', 'Attack Type').")
-        print("[INGEST] Falling back to ingesting ALL columns. This may lead to irrelevant/noisy answers.")
-        docs = df.fillna("").apply(lambda r: " | ".join([f"{c}: {r[c]}" for c in df.columns]), axis=1).tolist()
+    if not cols_to_use:
+        print("[INGEST] ERROR: Could not find expected columns (Attack Type, Attack Severity, etc.)")
+        print(f"[INGEST] Available columns: {list(df.columns)}")
+        return False, "missing_expected_columns"
     
-    # Filter out any empty documents that might have been created
+    print(f"[INGEST] Using text columns: {cols_to_use}")
+    
+    # Create clean, structured documents with labeled fields
+    def create_doc(row):
+        parts = []
+        for col in cols_to_use:
+            if pd.notna(row[col]) and str(row[col]).strip():
+                # Create labeled fields for better RAG retrieval
+                parts.append(f"{col}: {row[col]}")
+        return ". ".join(parts) if parts else ""
+    
+    docs = df.apply(create_doc, axis=1).tolist()
+    
+    # Filter out any empty documents
     docs = [d for d in docs if d.strip()]
+    
     if not docs:
         print("[INGEST] ERROR: No documents were created from the DataFrame.")
         return False, "no_documents_created"
-    # --- END FIXED LOGIC ---
-
+    
+    print(f"[INGEST] Created {len(docs)} clean documents")
+    print(f"[INGEST] Sample document: {docs[0][:200]}...")
+    
+    # Add documents in batches
     total_added = 0
     for i in range(0, len(docs), batch_docs):
         batch = docs[i:i+batch_docs]
@@ -259,11 +262,12 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
             vs.persist()
     except Exception:
         traceback.print_exc()
+    
     return True, {"method": method, "docs_added": total_added}
 
 
 def create_local_llm():
-    """Create a local HuggingFace Pipeline model with optimal generation settings"""
+    """Create a local HuggingFace Pipeline model with STRICT factual settings"""
     if HuggingFacePipeline is None:
         print("[LLM] HuggingFacePipeline not available.")
         return None
@@ -274,7 +278,6 @@ def create_local_llm():
     try:
         print(f"[LLM] Loading local model: {LOCAL_MODEL_ID}")
         
-        # Load tokenizer and model
         tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_ID)
         
         # For T5/Flan-T5 models (seq2seq)
@@ -282,25 +285,21 @@ def create_local_llm():
             model = AutoModelForSeq2SeqLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text2text-generation"
         else:
-            # For causal LM models
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text-generation"
         
-        # --- *** FACTUAL (Greedy) Generation Parameters *** ---
-        # We are DISABLING sampling to make the model factual and deterministic.
-        # This will stop the "sydney flood" type hallucinations.
+        # *** STRICT GREEDY DECODING - NO CREATIVITY ***
         pipe = pipeline(
             task,
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=256,
-            temperature=0.1,      # Set temperature very low
-            do_sample=False,      # *** DISABLES creative sampling ***
-            repetition_penalty=1.1,
+            max_new_tokens=300,      # *** INCREASED: Allow longer answers ***
+            temperature=0.0,         # *** PURE GREEDY DECODING ***
+            do_sample=False,         # *** NO SAMPLING ***
+            repetition_penalty=1.0,  # *** NO PENALTY (can interfere with factual text) ***
             early_stopping=True
         )
         
-        # Wrap in LangChain
         llm = HuggingFacePipeline(pipeline=pipe)
         
         print(f"[LLM] Local model loaded successfully: {LOCAL_MODEL_ID}")
@@ -312,7 +311,10 @@ def create_local_llm():
         return None
 
 def create_rag_chain(llm, vs):
-    """Create RAG chain with SIMPLE, EFFECTIVE prompt template"""
+    """
+    *** COMPLETELY REWRITTEN ***
+    Create RAG chain with a STRICT prompt that FORCES the model to use context
+    """
     if llm is None or vs is None:
         print("[RAG] Cannot create chain: llm or vs is None")
         return None
@@ -322,31 +324,33 @@ def create_rag_chain(llm, vs):
         return None
     
     try:
-        # --- *** FEW-SHOT PROMPT *** ---
-        # We give the model EXAMPLES of how to behave. This is a very
-        # powerful way to get the correct behavior from flan-t5.
-        template = """You are a cybersecurity expert. Follow the examples.
+        # *** CRITICAL FIX: STRICT PROMPT THAT FORCES CONTEXT USAGE ***
+        # The key is to make it CRYSTAL CLEAR that the model should ONLY use the context
+        template = """You must answer based ONLY on the context below. Do not use any external knowledge.
 
-Example 1:
-Context: Attack Type: Malware. Attack Severity: Medium. Threat Intelligence: Contained.
-Question: What is SQL Injection?
-Answer: SQL Injection (SQLi) is a type of cyberattack where an attacker inserts malicious SQL code into queries to manipulate a database.
+Context (this is retrieved information from the database):
+{context}
 
-Example 2:
-Context: Attack Type: DDoS. Attack Severity: High. Threat Intelligence: Contained. Response Action: Eradicated.
-Question: What was the response action for the DDoS attack?
-Answer: The response action for the DDoS attack was: Eradicated.
-
----
-Context: {context}
 Question: {question}
+
+Instructions:
+1. Read the context carefully
+2. If the answer is in the context, extract and explain it in 3-5 sentences
+3. If the answer is NOT in the context, respond with: "I cannot find this information in the provided context."
+4. DO NOT make up information
+5. DO NOT use general knowledge
+
 Answer:"""
         
         prompt = None
         if PromptTemplate is not None:
             try:
-                prompt = PromptTemplate(template=template, input_variables=["context", "question"])
-                print("[RAG] Created simple prompt template")
+                # *** CRITICAL: Use correct variable names ***
+                prompt = PromptTemplate(
+                    template=template, 
+                    input_variables=["context", "question"]
+                )
+                print("[RAG] Created strict context-forcing prompt template")
             except Exception:
                 traceback.print_exc()
         
@@ -357,13 +361,13 @@ Answer:"""
         
         rag = RetrievalQA.from_chain_type(
             llm=llm,
-            chain_type="stuff",
+            chain_type="stuff",  # "stuff" concatenates all docs into prompt
             retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),
             chain_type_kwargs=chain_type_kwargs,
-            return_source_documents=True  # *** CHANGED: We want to see the documents
+            return_source_documents=True
         )
         
-        print("[RAG] RAG chain created successfully")
+        print("[RAG] RAG chain created successfully with strict prompt")
         return rag
         
     except Exception as e:
@@ -425,7 +429,7 @@ async def lifespan(app: FastAPI):
     ml_models.clear()
     print("[LIFESPAN] shutdown complete.")
 
-app = FastAPI(lifespan=lifespan) # *** THIS LINE WAS FIXED ***
+app = FastAPI(lifespan=lifespan)
 
 class QueryRequest(BaseModel):
     query: str
@@ -479,7 +483,7 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
     if sample_limit is not None:
         df = df.head(sample_limit)
     
-    # --- Clear the old (noisy) data first ---
+    # Clear old data
     try:
         print("[INGEST] Clearing old data from vector store...")
         if hasattr(vs, "_collection"):
@@ -491,7 +495,7 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
         print(f"[INGEST] Error clearing old data: {e}. Continuing...")
         traceback.print_exc()
 
-    # --- Ingest the new (clean) data ---
+    # Ingest clean data
     ok, info = ingest_dataframe(df, vs, batch_docs=batch_size)
     if not ok:
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {info}")
@@ -499,7 +503,6 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
     final_count = vs_count_estimate(vs)
     return {"status": "ingested", "method_info": info, "final_count": int(final_count)}
 
-# --- NEW DEBUG ENDPOINT ---
 @app.get("/get-csv-columns")
 def get_csv_columns():
     csv_path = find_csv_path()
@@ -509,90 +512,69 @@ def get_csv_columns():
     if df is None:
         raise HTTPException(status_code=400, detail="CSV empty or unreadable.")
     return {"columns": list(df.columns)}
-# --- END NEW ENDPOINT ---
 
 @app.post("/generate-text", response_model=QueryResponse)
 def generate_text(req: QueryRequest):
+    """
+    *** COMPLETELY REWRITTEN ***
+    This version ALWAYS uses RAG and properly logs the retrieved context
+    """
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
     
     rag = ml_models.get("rag_chain")
-    llm = ml_models.get("local_llm") # Get the raw LLM
 
-    if rag is None or llm is None:
-        raise HTTPException(status_code=503, detail="RAG chain or LLM not available. Model may still be loading.")
+    if rag is None:
+        raise HTTPException(status_code=503, detail="RAG chain not available. Model may still be loading.")
     
     try:
-        # --- NEW DEBUGGING LOGIC ---
-        print("\n--- NEW QUERY RECEIVED ---")
-        print(f"Query: {req.query}")
+        print("\n" + "="*80)
+        print(f"[QUERY] {req.query}")
+        print("="*80)
         
-        # --- FIXED INVOCATION LOGIC ---
+        # *** ALWAYS USE RAG - NO BYPASSING ***
         out_text = None
         source_docs = []
         
-        # --- *** NEW ADAPTIVE LOGIC *** ---
-        # If it's a "What is" question, bypass RAG and just use the LLM's own knowledge.
-        # This prevents context-poisoning for definitions.
-        query_lower = req.query.strip().lower()
-        if query_lower.startswith("what is") or query_lower.startswith("what are"):
-            print("[INFO] Definitional question detected. Bypassing RAG to use model's internal knowledge.")
-            if hasattr(llm, "invoke"):
-                out_text = llm.invoke(req.query)
-            elif hasattr(llm, "run"):
-                out_text = llm.run(req.query)
-            elif callable(llm):
-                out_text = llm(req.query)
-            
-            # --- *** FIXED PARSER for text2text (flan-t5) *** ---
-            # The raw pipeline returns a list[dict]
-            if isinstance(out_text, list) and out_text:
-                if isinstance(out_text[0], dict):
-                    # T5 models use 'translation_text', Causal models use 'generated_text'
-                    out_text = out_text[0].get('translation_text') or out_text[0].get('generated_text')
-            
-            out_text = str(out_text)
-
-        else:
-            print("[INFO] Specific question detected. Using RAG chain.")
-            # We MUST use .invoke() because return_source_documents=True
-            if hasattr(rag, "invoke"):
-                # .invoke returns a dict, which should have sources
-                res = rag.invoke({"query": req.query})
-                if isinstance(res, dict):
-                    out_text = res.get("result")
-                    source_docs = res.get("source_documents")
-                else:
-                    out_text = str(res)
-            elif hasattr(rag, "run"):
-                 # This is now a fallback, but it shouldn't be hit
-                print("[WARN] Using .run() fallback, source documents will not be logged.")
-                out_text = rag.run(req.query)
-            elif callable(rag):
-                # Fallback for older chain types
-                print("[WARN] Using callable() fallback, source documents will not be logged.")
-                out_text = rag(req.query)
+        # Use .invoke() to get both result and source documents
+        if hasattr(rag, "invoke"):
+            res = rag.invoke({"query": req.query})
+            if isinstance(res, dict):
+                out_text = res.get("result")
+                source_docs = res.get("source_documents", [])
             else:
-                raise HTTPException(status_code=500, detail="RAG chain invocation method not found")
-
-        # --- LOG THE RETRIEVED CONTEXT (if RAG was used) ---
-        if source_docs:
-            print(f"[DEBUG] Retrieved {len(source_docs)} source document(s):")
-            for i, doc in enumerate(source_docs):
-                print(f"  DOC {i+1}: {doc.page_content[:500]}...") # Log first 500 chars
+                out_text = str(res)
+        elif hasattr(rag, "__call__"):
+            # Fallback for older versions
+            res = rag({"query": req.query})
+            if isinstance(res, dict):
+                out_text = res.get("result")
+                source_docs = res.get("source_documents", [])
+            else:
+                out_text = str(res)
         else:
-            # This is now expected for "what is" questions
-            if not (query_lower.startswith("what is") or query_lower.startswith("what are")):
-                print("[DEBUG] No source documents were returned by the chain (or .invoke() failed).")
+            raise HTTPException(status_code=500, detail="RAG chain invocation method not found")
+        
+        # *** LOG THE RETRIEVED CONTEXT ***
+        if source_docs:
+            print(f"\n[CONTEXT] Retrieved {len(source_docs)} document(s):")
+            for i, doc in enumerate(source_docs):
+                print(f"\n  --- Document {i+1} ---")
+                print(f"  {doc.page_content[:500]}...")
+        else:
+            print("\n[WARNING] No source documents were returned!")
         
         if out_text is None:
-             print("[ERROR] Failed to extract 'result' from RAG chain response.")
-             raise HTTPException(status_code=500, detail="Failed to get 'result' from RAG chain.")
-
-        print(f"Generated Answer: {out_text}")
-        print("--- QUERY COMPLETE ---")
+            print("[ERROR] Failed to extract 'result' from RAG chain response.")
+            raise HTTPException(status_code=500, detail="Failed to get 'result' from RAG chain.")
         
-        return QueryResponse(answer=str(out_text).strip())
+        # Clean up the output
+        out_text = str(out_text).strip()
+        
+        print(f"\n[ANSWER] {out_text}")
+        print("="*80 + "\n")
+        
+        return QueryResponse(answer=out_text)
 
     except Exception as e:
         traceback.print_exc()
@@ -600,4 +582,3 @@ def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn main:app --host 0.0.0.0 --port 8002")
-
