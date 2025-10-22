@@ -286,16 +286,17 @@ def create_local_llm():
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text-generation"
         
-        # --- *** SIMPLIFIED Generation Parameters *** ---
-        # We are removing min_length and other "creative" settings
-        # to make the model more factual and less likely to hallucinate.
+        # --- *** FACTUAL (Greedy) Generation Parameters *** ---
+        # We are DISABLING sampling to make the model factual and deterministic.
+        # This will stop the "sydney flood" type hallucinations.
         pipe = pipeline(
             task,
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=256, # Changed from max_length
-            temperature=0.7,
-            top_p=0.9,
+            max_new_tokens=256,
+            temperature=0.1,      # Set temperature very low
+            do_sample=False,      # *** DISABLES creative sampling ***
+            repetition_penalty=1.1,
             early_stopping=True
         )
         
@@ -422,9 +423,7 @@ async def lifespan(app: FastAPI):
     
     yield
     ml_models.clear()
-    print("[LIFESPAN] shutdown complete.")
-
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=app)
 
 class QueryRequest(BaseModel):
     query: str
@@ -543,10 +542,12 @@ def generate_text(req: QueryRequest):
             elif callable(llm):
                 out_text = llm(req.query)
             
-            # The raw llm.invoke() on a HuggingFacePipeline often returns the full text
+            # --- *** FIXED PARSER for text2text (flan-t5) *** ---
+            # The raw pipeline returns a list[dict]
             if isinstance(out_text, list) and out_text:
                 if isinstance(out_text[0], dict):
-                    out_text = out_text[0].get('generated_text')
+                    # T5 models use 'translation_text', Causal models use 'generated_text'
+                    out_text = out_text[0].get('translation_text') or out_text[0].get('generated_text')
             
             out_text = str(out_text)
 
