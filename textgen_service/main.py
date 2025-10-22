@@ -95,9 +95,9 @@ HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
 PRIMARY_REPO_ID = "mistralai/Mixtral-8x7B-Instruct-v0.1"    # may be gated / not hosted for inference
 # *** UPDATED FALLBACK_REPO_ID ***
-# Changed from 'google-t5/t5-small' which is not instruction-tuned
-# to 'google/flan-t5-base' which can follow instructions better.
-FALLBACK_REPO_ID = "google/flan-t5-base"
+# Switched back to 'google-t5/t5-small' which we know is available.
+# We will fix the prompt to get a better answer from it.
+FALLBACK_REPO_ID = "google-t5/t5-small"
 
 TOP_K = 4
 
@@ -285,12 +285,12 @@ def build_prompt_with_context(query: str, docs: list, model_id: str = "") -> str
 
     # --- UPDATED: Select prompt format based on model ---
     # T5 models prefer a "task" format
-    if "t5" in model_id.lower() or "flan" in model_id.lower():
+    if "t5" in model_id.lower():
+        # --- UPDATED: Use a Q&A format for non-instruct T5 ---
         if context:
-            # --- UPDATED: Put context first, question last ---
-            return f"context: {context} question: {query}"
+            return f"Context: {context}\n\nQ: {query}\n\nA:"
         else:
-            return f"question: {query}"
+            return f"Q: {query}\n\nA:"
 
     # Default to instruction format for models like Mixtral
     prompt = "Use the following context to answer the question concisely.\n\n"
@@ -465,8 +465,8 @@ def try_create_langchain_llm_and_rag(vs):
         llm = LC_HuggingFaceHub(repo_id=FALLBACK_REPO_ID, task="text2text-generation", huggingfacehub_api_token=HF_TOKEN, model_kwargs={"temperature":0.3, "max_new_tokens":512})
 
         # --- NEW: Define a custom prompt template for the T5 fallback model ---
-        # This matches the prompt format we built for the InferenceClient path
-        template = "context: {context} question: {question}"
+        # This matches the new Q&A prompt format
+        template = "Context: {context}\n\nQ: {question}\n\nA:"
         prompt = None
         if PromptTemplate is not None:
             try:
@@ -663,6 +663,7 @@ def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn textgen_service.main:app --host 0.0.0.0 --port 8002")
+
 
 
 
