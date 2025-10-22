@@ -1,6 +1,6 @@
 """
-Robust RAG service with LOCAL MODEL support - IMPROVED VERSION
-Now generates DETAILED, COMPLETE answers instead of single-word responses
+Robust RAG service with LOCAL MODEL support - FINAL FIXED VERSION
+Simple prompt that actually generates proper answers
 """
 import os
 import traceback
@@ -63,8 +63,7 @@ DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # Use a SMALL local model that works well for Q&A
-LOCAL_MODEL_ID = "google/flan-t5-base"  # Using base instead of small for better quality
-# If base is too slow, use: "google/flan-t5-small"
+LOCAL_MODEL_ID = "google/flan-t5-base"  # Using base for better quality
 
 TOP_K = 4
 
@@ -217,7 +216,7 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
     return True, {"method": method, "docs_added": total_added}
 
 def create_local_llm():
-    """Create a local HuggingFace Pipeline model with improved generation settings"""
+    """Create a local HuggingFace Pipeline model with optimal generation settings"""
     if HuggingFacePipeline is None:
         print("[LLM] HuggingFacePipeline not available.")
         return None
@@ -240,30 +239,23 @@ def create_local_llm():
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text-generation"
         
-        # Create pipeline with BETTER generation parameters
+        # Create pipeline with OPTIMIZED generation parameters
         pipe = pipeline(
             task,
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=512,  # INCREASED from 256 to allow longer answers
-            min_length=50,  # FORCE minimum length
-            temperature=0.7,  # INCREASED for more diverse outputs
+            max_length=512,  # Total max length
+            min_length=40,  # Minimum length
             do_sample=True,
-            top_p=0.95,  # Nucleus sampling
-            repetition_penalty=1.2,  # Prevent repetition
-            no_repeat_ngram_size=3  # Avoid repeating 3-grams
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.15,
+            no_repeat_ngram_size=3,
+            early_stopping=True
         )
         
-        # Wrap in LangChain with pipeline_kwargs
-        llm = HuggingFacePipeline(
-            pipeline=pipe,
-            model_kwargs={
-                "max_new_tokens": 512,
-                "min_length": 50,
-                "temperature": 0.7,
-                "do_sample": True
-            }
-        )
+        # Wrap in LangChain
+        llm = HuggingFacePipeline(pipeline=pipe)
         
         print(f"[LLM] Local model loaded successfully: {LOCAL_MODEL_ID}")
         return llm
@@ -274,7 +266,7 @@ def create_local_llm():
         return None
 
 def create_rag_chain(llm, vs):
-    """Create RAG chain with IMPROVED prompt template"""
+    """Create RAG chain with SIMPLE, EFFECTIVE prompt template"""
     if llm is None or vs is None:
         print("[RAG] Cannot create chain: llm or vs is None")
         return None
@@ -284,27 +276,19 @@ def create_rag_chain(llm, vs):
         return None
     
     try:
-        # IMPROVED prompt template that encourages detailed answers
-        template = """You are a cybersecurity expert. Use the following context to provide a detailed and comprehensive answer to the question.
-
-Context:
-{context}
+        # SIMPLE and DIRECT prompt template for T5
+        # This format works best with Flan-T5 models
+        template = """Context: {context}
 
 Question: {question}
 
-Provide a detailed answer that:
-1. Explains what it is
-2. Describes how it works
-3. Mentions its purpose or impact
-4. Provides relevant technical details
-
-Detailed Answer:"""
+Provide a detailed explanation that includes what it is, how it works, and its impact."""
         
         prompt = None
         if PromptTemplate is not None:
             try:
                 prompt = PromptTemplate(template=template, input_variables=["context", "question"])
-                print("[RAG] Created improved prompt template")
+                print("[RAG] Created simple prompt template")
             except Exception:
                 traceback.print_exc()
         
@@ -313,13 +297,12 @@ Detailed Answer:"""
         if prompt is not None:
             chain_type_kwargs["prompt"] = prompt
         
-        # Add return_source_documents for debugging
         rag = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
             retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),
             chain_type_kwargs=chain_type_kwargs,
-            return_source_documents=False  # Set to True if you want to see retrieved docs
+            return_source_documents=False
         )
         
         print("[RAG] RAG chain created successfully")
