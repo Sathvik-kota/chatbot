@@ -65,7 +65,7 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 # Use a SMALL local model that works well for Q&A
 LOCAL_MODEL_ID = "google/flan-t5-base"  # Using base for better quality
 
-TOP_K = 4
+TOP_K = 1
 
 # ---------------- Globals ----------------
 ml_models = {
