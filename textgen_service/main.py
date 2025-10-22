@@ -423,7 +423,9 @@ async def lifespan(app: FastAPI):
     
     yield
     ml_models.clear()
-app = FastAPI(lifespan=app)
+    print("[LIFESPAN] shutdown complete.")
+
+app = FastAPI(lifespan=lifespan) # *** THIS LINE WAS FIXED ***
 
 class QueryRequest(BaseModel):
     query: str
