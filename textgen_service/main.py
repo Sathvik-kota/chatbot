@@ -1,14 +1,10 @@
 """
-Robust RAG service with multi-path LLM support:
+Robust RAG service with multi-path LLM support - FIXED VERSION
 
 Priority:
   1) huggingface_hub.InferenceClient -> preferred (Inference API)
   2) langchain_community.llms.HuggingFaceHub -> fallback LLM via HF Hub (must have HF token)
   3) If neither available, the server will report the missing pieces clearly.
-
-Make sure your CSV is at:
-  /content/project/textgen_service/ai_cybersecurity_dataset-sampled-5k.csv
-or upload via /upload-csv endpoint and call /force-ingest.
 """
 import os
 import traceback
@@ -40,7 +36,6 @@ try:
 except Exception:
     LC_HuggingFaceHub = None
 
-# --- NEW IMPORT ---
 try:
     from langchain.prompts import PromptTemplate
 except Exception:
@@ -48,9 +43,7 @@ except Exception:
         from langchain_core.prompts import PromptTemplate
     except Exception:
         PromptTemplate = None
-# --------------------
 
-# RetrievalQA import (try usual places)
 try:
     from langchain.chains import RetrievalQA
 except Exception:
@@ -86,18 +79,14 @@ if RecursiveCharacterTextSplitter is None:
 ROOT_DIR = os.path.dirname(__file__) or os.getcwd()
 CHROMA_DB_PATH = os.path.join(ROOT_DIR, "chroma_db")
 DOCUMENTS_DIR = os.path.join(ROOT_DIR, "documents")
-# Exact file path you reported
 HARDCODED_CSV_PATH = "/content/project/textgen_service/ai_cybersecurity_dataset-sampled-5k.csv"
 DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
-PRIMARY_REPO_ID = "mistralai/Mixtral-8x7B-Instruct-v0.1"    # may be gated / not hosted for inference
-# *** UPDATED FALLBACK_REPO_ID ***
-# All instruction-tuned models are 404.
-# Reverting to the *only* model that was accessible: google-t5/t5-small
-FALLBACK_REPO_ID = "google-t5/t5-small"
+PRIMARY_REPO_ID = "mistralai/Mixtral-8x7B-Instruct-v0.1"  # may be gated / not hosted for inference
+FALLBACK_REPO_ID = "google/flan-t5-base"  # Updated fallback model available on HF Inference (instruction-tuned T5)
 
 TOP_K = 4
 
@@ -154,14 +143,12 @@ def init_chroma(embedding_function):
     if LC_Chroma is None:
         print("[CHROMA] langchain_community.Chroma import not available.")
         return None
-    # Try persist_directory constructor (common)
     try:
         vs = LC_Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=embedding_function)
         print("[CHROMA] Initialized with persist_directory.")
         return vs
     except Exception:
         traceback.print_exc()
-    # Try client-based init with chromadb
     try:
         import chromadb
         try:
@@ -174,7 +161,6 @@ def init_chroma(embedding_function):
             return vs
     except Exception:
         traceback.print_exc()
-    # in-memory fallback
     try:
         vs = LC_Chroma(embedding_function=embedding_function)
         print("[CHROMA] Initialized in-memory Chroma.")
@@ -203,7 +189,6 @@ def vs_count_estimate(vs) -> int:
     return 0
 
 def _try_add_texts(vs, texts):
-    # multiple strategies to add texts (various versions of wrappers)
     try:
         if hasattr(vs, "add_texts"):
             vs.add_texts(texts=texts)
@@ -257,22 +242,32 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
 def check_inference_endpoint(repo_id: str, token: str, timeout: int = 8) -> bool:
     if not token:
         return False
-    url = f"https://api-inference.huggingface.co/models/{repo_id}"
+
+    # New router endpoint for HF Inference
+    new_url = f"https://router.huggingface.co/hf-inference/models/{repo_id}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {token}"}
+
     try:
-        r = requests.head(url, headers=headers, timeout=timeout)
+        r = requests.head(new_url, headers=headers, timeout=timeout)
         if r.status_code == 200:
             return True
-        # treat 401/403/404 as unavailable
+    except Exception:
+        pass
+
+    # Fallback to old API endpoint
+    old_url = f"https://api-inference.huggingface.co/models/{repo_id}"
+    try:
+        r = requests.head(old_url, headers=headers, timeout=timeout)
+        if r.status_code == 200:
+            return True
         if r.status_code in (401, 403, 404):
             return False
-        r2 = requests.get(url, headers=headers, timeout=timeout)
+        r2 = requests.get(old_url, headers=headers, timeout=timeout)
         return r2.status_code == 200
     except Exception:
         return False
 
 def build_prompt_with_context(query: str, docs: list, model_id: str = "") -> str:
-    """Builds a prompt, optimizing the format for the specific model_id."""
     ctx_items = []
     for d in docs:
         if hasattr(d, "page_content"):
@@ -283,30 +278,27 @@ def build_prompt_with_context(query: str, docs: list, model_id: str = "") -> str
             ctx_items.append(str(d).strip())
     context = "\n\n---\n\n".join(ctx_items) if ctx_items else "No context provided."
 
-    # --- UPDATED: Select prompt format based on model ---
-    # T5 models prefer a "task" format
-    if "t5" in model_id.lower():
-        # --- UPDATED: Use a summarization-style prefix to force a different task ---
-        # This is a bit of a trick to stop it from just repeating the context.
-        return f"""summarize: {context}
+    if "t5" in model_id.lower() or "flan" in model_id.lower():
+        return f"""Answer the following question based on the context provided.
 
-Given the context above, {query}"""
+Context: {context}
 
-    # Default to instruction format for models like Mixtral
+Question: {query}
+
+Answer:"""
+
     prompt = "Use the following context to answer the question concisely.\n\n"
     if context:
         prompt += f"CONTEXT:\n{context}\n\n"
     prompt += f"QUESTION:\n{query}\n\nAnswer:"
     return prompt
 
-# ---------- Inference helpers (robust) ----------
 def _parse_inference_response(gen, method_name: str) -> str:
     try:
         if isinstance(gen, list):
             first = gen[0]
             if isinstance(first, dict):
-                # --- UPDATED: Added 'translation_text' for T5 models ---
-                for key in ("generated_text", "generated_texts", "text", "output", "result", "translation_text"):
+                for key in ("generated_text", "generated_texts", "text", "output", "result", "translation_text", "answer"):
                     if key in first:
                         val = first[key]
                         if isinstance(val, list):
@@ -316,8 +308,7 @@ def _parse_inference_response(gen, method_name: str) -> str:
             else:
                 return str(first)
         if isinstance(gen, dict):
-            # --- UPDATED: Added 'translation_text' for T5 models ---
-            for key in ("generated_text", "generated_texts", "text", "output", "result", "translation_text"):
+            for key in ("generated_text", "generated_texts", "text", "output", "result", "translation_text", "answer"):
                 if key in gen:
                     val = gen[key]
                     if isinstance(val, list):
@@ -340,7 +331,6 @@ def _parse_inference_response(gen, method_name: str) -> str:
         return str(gen)
 
 def generate_with_inference(client, model_id: str, retriever, query: str, top_k: int = TOP_K, max_new_tokens: int = 256):
-    # retrieve
     docs = []
     try:
         retr = None
@@ -358,13 +348,11 @@ def generate_with_inference(client, model_id: str, retriever, query: str, top_k:
         docs = []
 
     docs = docs[:top_k] if docs else []
-    # --- UPDATED: Pass model_id to build the correct prompt ---
     prompt = build_prompt_with_context(query, docs, model_id)
 
     last_exc = None
     tried = []
 
-    # 1) text_generation (common)
     try:
         if hasattr(client, "text_generation"):
             tried.append("text_generation")
@@ -374,7 +362,6 @@ def generate_with_inference(client, model_id: str, retriever, query: str, top_k:
         last_exc = e
         traceback.print_exc()
 
-    # 2) generate
     try:
         if hasattr(client, "generate"):
             tried.append("generate")
@@ -384,7 +371,6 @@ def generate_with_inference(client, model_id: str, retriever, query: str, top_k:
         last_exc = e
         traceback.print_exc()
 
-    # 3) callable client (some versions)
     try:
         if callable(client):
             tried.append("__call__")
@@ -397,27 +383,33 @@ def generate_with_inference(client, model_id: str, retriever, query: str, top_k:
         last_exc = e
         traceback.print_exc()
 
-    # 4) streaming or alternate names
     try:
-        for alt in ("text_generation_stream", "text_generation_streaming"):
-            if hasattr(client, alt):
-                tried.append(alt)
-                gen = getattr(client, alt)(prompt, max_new_tokens=max_new_tokens)
-                return _parse_inference_response(gen, alt)
+        tried.append("raw_http_new_endpoint")
+        url = f"https://router.huggingface.co/hf-inference/models/{model_id}/v1/chat/completions"
+        headers = {"Authorization": f"Bearer {HF_TOKEN}", "Content-Type": "application/json"}
+        payload = {
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_new_tokens
+        }
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        r.raise_for_status()
+        gen = r.json()
+        if "choices" in gen and len(gen["choices"]) > 0:
+            return gen["choices"][0]["message"]["content"]
+        return _parse_inference_response(gen, "raw_http_new_endpoint")
     except Exception as e:
         last_exc = e
         traceback.print_exc()
 
-    # 5) raw HTTP fallback
     try:
-        tried.append("raw_http")
+        tried.append("raw_http_old_endpoint")
         url = f"https://api-inference.huggingface.co/models/{model_id}"
         headers = {"Authorization": f"Bearer {HF_TOKEN}"}
         payload = {"inputs": prompt, "parameters": {"max_new_tokens": max_new_tokens}}
         r = requests.post(url, headers=headers, json=payload, timeout=60)
         r.raise_for_status()
         gen = r.json()
-        return _parse_inference_response(gen, "raw_http")
+        return _parse_inference_response(gen, "raw_http_old_endpoint")
     except Exception as e:
         last_exc = e
         traceback.print_exc()
@@ -425,14 +417,13 @@ def generate_with_inference(client, model_id: str, retriever, query: str, top_k:
     raise RuntimeError(f"Inference failed. Tried methods: {tried}. Last error: {last_exc}")
 
 def try_init_inference_client(vs):
-    # Try to initialize huggingface_hub.InferenceClient for primary, then fallback model
     if InferenceClient is None:
         print("[LLM] InferenceClient not installed.")
         return None, None
     if not HF_TOKEN:
         print("[LLM] HF token not set.")
         return None, None
-    # primary
+
     if check_inference_endpoint(PRIMARY_REPO_ID, HF_TOKEN):
         try:
             client = InferenceClient(model=PRIMARY_REPO_ID, token=HF_TOKEN)
@@ -440,7 +431,7 @@ def try_init_inference_client(vs):
             return client, PRIMARY_REPO_ID
         except Exception:
             traceback.print_exc()
-    # fallback public
+
     if check_inference_endpoint(FALLBACK_REPO_ID, HF_TOKEN):
         try:
             client = InferenceClient(model=FALLBACK_REPO_ID, token=HF_TOKEN)
@@ -448,11 +439,11 @@ def try_init_inference_client(vs):
             return client, FALLBACK_REPO_ID
         except Exception:
             traceback.print_exc()
+
     print("[LLM] No inference endpoints available for primary/fallback.")
     return None, None
 
 def try_create_langchain_llm_and_rag(vs):
-    # Try to create a langchain RetrievalQA using HuggingFaceHub (community) as a fallback
     if LC_HuggingFaceHub is None:
         print("[LLM] langchain_community.HuggingFaceHub not available.")
         return None
@@ -460,20 +451,26 @@ def try_create_langchain_llm_and_rag(vs):
         print("[LLM] HF token not set for HuggingFaceHub.")
         return None
     try:
-        # use a small public model as fallback; specify task to satisfy the pydantic validation
         print(f"[LLM] Trying HuggingFaceHub with {FALLBACK_REPO_ID}")
-        # --- UPDATED: Switched task back to T5's task ---
-        llm = LC_HuggingFaceHub(repo_id=FALLBACK_REPO_ID, task="text2text-generation", huggingfacehub_api_token=HF_TOKEN, model_kwargs={"temperature":0.3, "max_new_tokens":512})
+        task = "text2text-generation" if "t5" in FALLBACK_REPO_ID.lower() or "flan" in FALLBACK_REPO_ID.lower() else "text-generation"
 
-        # --- UPDATED: Dynamic prompt template based on the fallback model ---
-        # This fixes a bug where the T5 prompt was hard-coded.
+        llm = LC_HuggingFaceHub(
+            repo_id=FALLBACK_REPO_ID,
+            task=task,
+            huggingfacehub_api_token=HF_TOKEN,
+            model_kwargs={"temperature": 0.3, "max_new_tokens": 512}
+        )
+
         template = ""
-        if "t5" in FALLBACK_REPO_ID.lower():
-            template = """summarize: {context}
+        if "t5" in FALLBACK_REPO_ID.lower() or "flan" in FALLBACK_REPO_ID.lower():
+            template = """Answer the following question based on the context provided.
 
-Given the context above, {question}"""
+Context: {context}
+
+Question: {question}
+
+Answer:"""
         else:
-            # Default instruction prompt for models like GPT-2, BLOOM, Falcon
             template = """Use the following context to answer the question concisely.
 
 CONTEXT:
@@ -492,10 +489,8 @@ Answer:"""
             except Exception:
                 traceback.print_exc()
                 prompt = None
-        # --------------------------------------------------------------------
 
         if RetrievalQA is not None:
-            # --- UPDATED: Pass the custom prompt if it was created ---
             chain_type_kwargs = {}
             if prompt is not None:
                 chain_type_kwargs["prompt"] = prompt
@@ -506,7 +501,6 @@ Answer:"""
                 retriever=vs.as_retriever(),
                 chain_type_kwargs=chain_type_kwargs
             )
-            # ----------------------------------------------------------
             print("[LLM] RetrievalQA (HuggingFaceHub) created.")
             return rag
         else:
@@ -516,18 +510,14 @@ Answer:"""
         traceback.print_exc()
         return None
 
-# ---------------- FastAPI lifecycle ----------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[LIFESPAN] starting up...")
-    # embedding
     ml_models["embedding_function"] = create_embedding_function()
-    # chroma
     ml_models["vector_store"] = init_chroma(ml_models["embedding_function"])
     vs = ml_models["vector_store"]
     print(f"[LIFESPAN] vector_store object: {type(vs).__name__ if vs is not None else None}")
 
-    # find CSV and auto-ingest if empty
     csv_path = find_csv_path()
     if csv_path:
         print(f"[LIFESPAN] Found CSV at: {csv_path}")
@@ -549,12 +539,10 @@ async def lifespan(app: FastAPI):
     else:
         print("[LIFESPAN] Skipping auto-ingest (no vs or no csv)")
 
-    # Try inference client (primary -> fallback)
     client, model_id = try_init_inference_client(vs)
     ml_models["hf_inference_client"] = client
     ml_models["hf_model_id"] = model_id
 
-    # If inference client unavailable, try langchain HuggingFaceHub fallback to create RetrievalQA chain
     if ml_models["hf_inference_client"] is None and vs is not None:
         rag = try_create_langchain_llm_and_rag(vs)
         ml_models["rag_chain"] = rag
@@ -576,7 +564,6 @@ async def lifespan(app: FastAPI):
     ml_models.clear()
     print("[LIFESPAN] shutdown complete.")
 
-# ---------------- App ----------------
 app = FastAPI(lifespan=lifespan)
 
 class QueryRequest(BaseModel):
@@ -641,11 +628,10 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
 def generate_text(req: QueryRequest):
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
-    # Prefer InferenceClient path
     client = ml_models.get("hf_inference_client")
     model_id = ml_models.get("hf_model_id")
     vs = ml_models.get("vector_store")
-    # If inference client available, use it (preferred)
+
     if client is not None and model_id is not None:
         try:
             retriever = None
@@ -658,11 +644,10 @@ def generate_text(req: QueryRequest):
         except Exception as e:
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"Generation failed (inference client): {e}")
-    # Else, use a local RetrievalQA chain via HuggingFaceHub (if present)
+
     rag = ml_models.get("rag_chain")
     if rag is not None:
         try:
-            # Many RetrievalQA interfaces: prefer .run, then .invoke
             if hasattr(rag, "run"):
                 out = rag.run(req.query)
                 return QueryResponse(answer=str(out))
@@ -670,17 +655,13 @@ def generate_text(req: QueryRequest):
                 res = rag.invoke({"query": req.query})
                 return QueryResponse(answer=str(res.get("result") if isinstance(res, dict) else res))
             else:
-                out = rag(req.GagQueryRequest) if callable(rag) else None
+                out = rag(req.query) if callable(rag) else None
                 return QueryResponse(answer=str(out))
         except Exception as e:
             traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"Generation failed (HuggingFaceHub fallback): {e}")
-    # Nothing available
+
     raise HTTPException(status_code=503, detail="No inference client or fallback LLM available. Check HF token and model access.")
 
 if __name__ == "__main__":
-    print("Run: uvicorn textgen_service.main:app --host 0.0.0.0 --port 8002")
-
-
-
-
+    print("Run: uvicorn main:app --host 0.0.0.0 --port 8002")
