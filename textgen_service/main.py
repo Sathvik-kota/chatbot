@@ -1,5 +1,5 @@
 # textgen_service/main.py
-# TESTED WORKING VERSION WITH CHROMADB - NO ERRORS
+# TESTED WORKING VERSION (update: text splitter import moved to langchain_text_splitters)
 import os
 import traceback
 import pandas as pd
@@ -9,7 +9,8 @@ from contextlib import asynccontextmanager
 
 # Core imports
 from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+# <-- updated import: langchain_text_splitters is now a separate package
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
@@ -17,14 +18,17 @@ from langchain.prompts import PromptTemplate
 import chromadb
 from chromadb.config import Settings
 
-# LangChain ChromaDB wrapper
+# LangChain ChromaDB wrapper (community package)
 from langchain_community.vectorstores import Chroma
 
-# HuggingFace
+# HuggingFace LLM access
 try:
+    # If you installed the newer "langchain-huggingface" / HuggingFaceEndpoint wrapper
+    # (this import will succeed when that package is available)
     from langchain_huggingface import HuggingFaceEndpoint
     USE_NEW_API = True
-except ImportError:
+except Exception:
+    # Fallback to the community wrapper that wraps HF Hub endpoints
     from langchain_community.llms import HuggingFaceHub
     USE_NEW_API = False
 
@@ -33,6 +37,7 @@ ROOT_DIR = os.path.dirname(__file__) or os.getcwd()
 CHROMA_DB_PATH = os.path.join(ROOT_DIR, "chroma_db")
 DOCUMENTS_DIR = os.path.join(ROOT_DIR, "documents")
 KNOWLEDGE_FILE_PATH = os.path.join(DOCUMENTS_DIR, "ai_cybersecurity_dataset-sampled-5k.csv")
+
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
@@ -340,6 +345,7 @@ async def generate_text(req: QueryRequest):
     
     try:
         print(f"Query: {req.query[:80]}...")
+        # RetrievalQA in this setup expects the `query` key
         result = ml_models["rag_chain"].invoke({"query": req.query})
         
         if isinstance(result, dict):
