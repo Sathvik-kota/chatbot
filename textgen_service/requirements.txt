@@ -1,23 +1,13 @@
-# Web / API
-fastapi
-uvicorn[standard]
-# Data
+fastapi==0.95.2
+uvicorn[standard]==0.22.0
 pandas==2.1.1
-
-# Vector DB
 chromadb==0.4.7
-
-# Embeddings & transformers
-sentence-transformers==2.6.0
-transformers==4.35.0
-
-# Torch (you already have torch 2.8.0+cu126 — remove or change if you want)
+sentence-transformers==2.2.2
+transformers==4.44.2
+tokenizers==0.19.1
+# If you want to pin torch, do so OR rely on your installed torch (you said you have 2.8.0+cu126)
 # torch==2.8.0+cu126
-
-# LangChain ecosystem
-langchain
+langchain==0.3.27
 langchain-text-splitters==0.3.11
 langchain-huggingface==0.1.0
-
-# Environment
 python-dotenv==1.1.1
