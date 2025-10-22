@@ -5,15 +5,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
-# UPDATED IMPORTS - No more deprecation warnings!
+# USE NEW LANGCHAIN-HUGGINGFACE PACKAGE (No deprecation warnings!)
 try:
     from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint
-    USE_NEW_IMPORTS = True
+    print("Using langchain-huggingface package (recommended)")
 except ImportError:
-    # Fallback for older installations
+    print("WARNING: langchain-huggingface not installed, using deprecated imports")
     from langchain_community.embeddings import HuggingFaceEmbeddings
     from langchain_community.llms import HuggingFaceHub as HuggingFaceEndpoint
-    USE_NEW_IMPORTS = False
 
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -57,9 +56,14 @@ async def lifespan(app: FastAPI):
 
     # 1) initialize embedding function
     try:
-        emb_fn = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+        print(f"LIFESPAN: Initializing embeddings with model: {EMBEDDING_MODEL_NAME}")
+        emb_fn = HuggingFaceEmbeddings(
+            model_name=EMBEDDING_MODEL_NAME,
+            model_kwargs={'device': 'cpu'},  # Use 'cuda' if GPU available
+            encode_kwargs={'normalize_embeddings': True}
+        )
         ml_models["embedding_function"] = emb_fn
-        print(f"LIFESPAN: embedding function initialized (using new imports: {USE_NEW_IMPORTS}).")
+        print("LIFESPAN: embedding function initialized successfully.")
     except Exception as e:
         print("LIFESPAN: failed to initialize embeddings.")
         print(f"Error: {e}")
@@ -138,18 +142,24 @@ async def lifespan(app: FastAPI):
                 try:
                     print(f"LIFESPAN: creating LLM for {repo_id}")
                     
-                    # Use new HuggingFaceEndpoint
+                    # CORRECTED: Use proper HuggingFaceEndpoint parameters
                     llm = HuggingFaceEndpoint(
                         repo_id=repo_id,
                         huggingfacehub_api_token=HF_TOKEN,
-                        temperature=0.5,
-                        max_new_tokens=1024
+                        # Use model_kwargs for generation parameters
+                        model_kwargs={
+                            "temperature": 0.5,
+                            "max_new_tokens": 512,
+                            "top_p": 0.95,
+                            "repetition_penalty": 1.1
+                        }
                     )
                     
                     rag = RetrievalQA.from_chain_type(
                         llm=llm,
                         chain_type="stuff",
-                        retriever=vs.as_retriever(search_kwargs={"k": 3})
+                        retriever=vs.as_retriever(search_kwargs={"k": 3}),
+                        return_source_documents=False
                     )
                     print(f"LIFESPAN: LLM {repo_id} initialized successfully.")
                     return rag
@@ -165,17 +175,26 @@ async def lifespan(app: FastAPI):
             
             ml_models["rag_chain"] = rag
 
-    print("LIFESPAN: startup complete. Status:", {
+    startup_status = {
         "vector_store_ready": bool(vs),
         "rag_chain_ready": bool(ml_models.get("rag_chain")),
         "hf_token_set": bool(HF_TOKEN),
-    })
+    }
+    print("LIFESPAN: startup complete. Status:", startup_status)
+    
     yield
+    
+    # Cleanup
     ml_models.clear()
     print("LIFESPAN: shutdown complete.")
 
 # ---------- FastAPI app ----------
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="Text Generation RAG Service",
+    description="Network traffic analysis using RAG with ChromaDB and HuggingFace LLMs",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
 class QueryRequest(BaseModel):
     query: str
@@ -185,35 +204,62 @@ class QueryResponse(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "Text Generation (RAG) Service is running."}
+    return {
+        "status": "Text Generation (RAG) Service is running.",
+        "endpoints": {
+            "status": "/status",
+            "generate": "/generate-text (POST)"
+        }
+    }
 
 @app.get("/status")
 def status():
+    vs = ml_models.get("vector_store")
+    collection_count = 0
+    if vs:
+        try:
+            collection_count = vs._collection.count()
+        except:
+            pass
+    
     return {
-        "vector_store_ready": bool(ml_models.get("vector_store")),
+        "vector_store_ready": bool(vs),
+        "vector_store_count": collection_count,
         "rag_chain_ready": bool(ml_models.get("rag_chain")),
         "hf_token_set": bool(HF_TOKEN),
+        "embedding_model": EMBEDDING_MODEL_NAME,
+        "primary_llm": PRIMARY_REPO_ID
     }
 
 @app.post("/generate-text", response_model=QueryResponse)
 async def generate_text(req: QueryRequest):
     rag_chain = ml_models.get("rag_chain")
     if not rag_chain:
-        raise HTTPException(status_code=503, detail="RAG chain is not available.")
+        raise HTTPException(
+            status_code=503, 
+            detail="RAG chain is not available. Check /status endpoint for details."
+        )
     
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
     
     try:
-        print(f"Invoking RAG chain with query: {req.query}")
+        print(f"Processing query: {req.query}")
         result = rag_chain.invoke({"query": req.query})
         
         answer = result.get("result", "No answer generated.")
-        print(f"RAG chain generated answer: {answer}")
+        print(f"Generated answer: {answer[:100]}...")
         
         return QueryResponse(answer=str(answer))
 
     except Exception as e:
         print("Generation error:")
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Generation failed: {str(e)}"
+        )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8002)
