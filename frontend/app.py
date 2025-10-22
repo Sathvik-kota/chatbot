@@ -11,6 +11,7 @@ st.markdown("""
 /* Main app styling */
 .main {
     background-color: #f0f2f6; /* Light gray background */
+    padding-top: 0rem; /* Move content to the top */
 }
 
 /* Title */
@@ -18,6 +19,8 @@ h1 {
     color: #1a1a68; /* Deep blue */
     font-family: 'Arial Black', sans-serif;
     text-align: center;
+    margin-bottom: 0;
+    padding-top: 0;
 }
 
 /* Headers (h2) for features */
@@ -86,7 +89,7 @@ h2 {
 
 # --- Main Title ---
 st.title("🤖 MicroChaTBoT")
-st.markdown("<h3 style='text-align: center; color: #333; font-family: Arial, sans-serif; font-weight: normal; margin-top: -15px;'>Watch Multimodal Dashboard <span style='font-size: 0.9em; color: #555;'>&nbsp;&nbsp;|&nbsp;&nbsp;Use the sidebar to pick a feature.</span></h3>", unsafe_allow_html=True)
+st.markdown("<h3 style='text-align: center; color: #333; font-family: Arial, sans-serif; font-weight: normal; margin-top: 0; padding-top: 0;'>Watch Multimodal Dashboard <span style='font-size: 0.9em; color: #555;'>&nbsp;&nbsp;|&nbsp;&nbsp;Use the sidebar to pick a feature.</span></h3>", unsafe_allow_html=True)
 
 
 # --- Sidebar ---
