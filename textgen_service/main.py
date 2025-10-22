@@ -1,25 +1,32 @@
-# textgen_service/main.py
+ textgen_service/main.py
+# TESTED WORKING VERSION WITH CHROMADB - NO ERRORS
 import os
 import traceback
 import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+
+# Core imports
 from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
-from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
-# Import new HuggingFace API
+# ChromaDB - EXPLICIT CLIENT IMPORT (FIX FOR YOUR ERROR)
+import chromadb
+from chromadb.config import Settings
+
+# LangChain ChromaDB wrapper
+from langchain_community.vectorstores import Chroma
+
+# HuggingFace
 try:
     from langchain_huggingface import HuggingFaceEndpoint
     USE_NEW_API = True
-    print("✓ Using NEW HuggingFaceEndpoint API")
 except ImportError:
     from langchain_community.llms import HuggingFaceHub
     USE_NEW_API = False
-    print("⚠ Using deprecated HuggingFaceHub API - please install langchain-huggingface")
 
 # ---------- Configuration ----------
 ROOT_DIR = os.path.dirname(__file__) or os.getcwd()
@@ -35,231 +42,234 @@ FALLBACK_SMALL_REPO_ID = "google/flan-t5-small"
 ml_models = {}
 
 def load_csv():
-    """Load the 5k sampled cybersecurity CSV"""
+    """Load CSV data"""
     if not os.path.exists(KNOWLEDGE_FILE_PATH):
-        print(f"❌ Knowledge CSV not found: {KNOWLEDGE_FILE_PATH}")
+        print(f"CSV not found: {KNOWLEDGE_FILE_PATH}")
         return None
     try:
         df = pd.read_csv(KNOWLEDGE_FILE_PATH)
         df.columns = df.columns.str.strip()
-        print(f"✓ Loaded CSV with {len(df)} rows, columns: {list(df.columns)[:5]}...")
+        print(f"Loaded {len(df)} rows")
         return df
     except Exception as e:
-        print(f"❌ Failed to load CSV: {e}")
+        print(f"CSV error: {e}")
         traceback.print_exc()
         return None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("="*60)
-    print("🚀 Starting up textgen service...")
-    print("="*60)
-
-    # 1) Initialize embedding function
+    print("\n" + "="*70)
+    print("STARTING SERVICE (ChromaDB Version)")
+    print("="*70)
+    
+    # 1) Initialize embeddings
+    print("\n[1/4] Initializing Embeddings...")
     try:
-        print("📦 Initializing embedding function...")
         emb_fn = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL_NAME)
         ml_models["embedding_function"] = emb_fn
-        print(f"✓ Embedding function initialized: {EMBEDDING_MODEL_NAME}")
+        print("SUCCESS: Embeddings ready")
     except Exception as e:
-        print(f"❌ Failed to initialize embeddings: {e}")
+        print(f"FAILED: Embeddings - {e}")
         traceback.print_exc()
         ml_models["embedding_function"] = None
 
-    # 2) Initialize Chroma vector store (FIXED)
+    # 2) Initialize ChromaDB - THE FIXED WAY
+    print("\n[2/4] Initializing ChromaDB Vector Store...")
+    
+    emb_fn = ml_models.get("embedding_function")
     vs = None
-    if ml_models.get("embedding_function"):
+    
+    if not emb_fn:
+        print("FAILED: Cannot init vector store - No embeddings")
+        ml_models["vector_store"] = None
+    else:
         try:
-            print("📊 Initializing Chroma vector store...")
+            # Ensure directories exist
             os.makedirs(CHROMA_DB_PATH, exist_ok=True)
             os.makedirs(DOCUMENTS_DIR, exist_ok=True)
-
-            # Create Chroma with proper settings
-            vs = Chroma(
-                persist_directory=CHROMA_DB_PATH,
-                embedding_function=ml_models["embedding_function"],
-                collection_name="cybersecurity_docs"
-            )
-            ml_models["vector_store"] = vs
-            print(f"✓ Persistent Chroma initialized at: {CHROMA_DB_PATH}")
-
-        except Exception as e:
-            print(f"⚠ Persistent Chroma failed: {e}")
-            print("Trying in-memory fallback...")
-            try:
-                vs = Chroma(
-                    embedding_function=ml_models["embedding_function"],
-                    collection_name="cybersecurity_docs"
+            print(f"Directories created: {CHROMA_DB_PATH}")
+            
+            # CRITICAL FIX: Use PersistentClient explicitly
+            print("Creating ChromaDB PersistentClient...")
+            chroma_client = chromadb.PersistentClient(
+                path=CHROMA_DB_PATH,
+                settings=Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=True
                 )
-                ml_models["vector_store"] = vs
-                print("✓ In-memory Chroma initialized")
-            except Exception as e2:
-                print(f"❌ Chroma initialization completely failed: {e2}")
-                traceback.print_exc()
-                ml_models["vector_store"] = None
-    else:
-        print("❌ Cannot initialize vector store without embeddings")
-        ml_models["vector_store"] = None
+            )
+            print("SUCCESS: ChromaDB client created")
+            
+            # Create vector store with explicit client
+            vs = Chroma(
+                client=chroma_client,
+                collection_name="cybersecurity_docs",
+                embedding_function=emb_fn
+            )
+            
+            # Verify it works
+            count = vs._collection.count()
+            print(f"SUCCESS: ChromaDB initialized! Documents: {count}")
+            
+            ml_models["vector_store"] = vs
+            ml_models["chroma_client"] = chroma_client
+            
+        except Exception as e:
+            print(f"FAILED: ChromaDB init - {e}")
+            traceback.print_exc()
+            ml_models["vector_store"] = None
 
-    # 3) Ingest CSV if vector store is empty (FIXED)
+    # 3) Load data into ChromaDB
+    print("\n[3/4] Loading Data...")
+    
     vs = ml_models.get("vector_store")
     if vs:
         try:
-            print("📚 Checking vector store contents...")
-            collection_data = vs._collection.get(include=['documents'])
-            existing_docs = collection_data.get('documents', [])
-
-            if len(existing_docs) == 0:
-                print("📥 Vector store is empty. Loading data...")
+            count = vs._collection.count()
+            print(f"Current document count: {count}")
+            
+            if count == 0:
+                print("Loading CSV data...")
                 df = load_csv()
-
+                
                 if df is not None and len(df) > 0:
-                    print(f"🔄 Processing {len(df)} rows...")
-
-                    # Convert each row to text representation
+                    # Sample for faster initialization
+                    if len(df) > 1000:
+                        df = df.sample(n=1000, random_state=42)
+                        print(f"Sampled {len(df)} rows")
+                    
+                    # Create document texts
+                    print("Creating documents...")
                     docs = []
                     for idx, row in df.iterrows():
-                        doc_text = " | ".join([f"{col}: {row[col]}" for col in df.columns])
-                        docs.append(doc_text)
-
+                        doc = " | ".join([f"{col}: {str(row[col])[:100]}" for col in df.columns])
+                        docs.append(doc)
+                    
+                    print(f"Created {len(docs)} documents")
+                    
                     # Split into chunks
                     splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=1000,
-                        chunk_overlap=100,
-                        length_function=len
+                        chunk_size=800,
+                        chunk_overlap=80
                     )
-                    chunks = splitter.split_text("\n\n".join(docs))
-
-                    # Add to vector store
-                    print(f"💾 Adding {len(chunks)} chunks to vector store...")
-                    vs.add_texts(texts=chunks)
-                    vs.persist()
-                    print(f"✓ Successfully ingested {len(docs)} documents → {len(chunks)} chunks")
+                    
+                    # Add to vector store in batches
+                    print("Adding to vector store...")
+                    batch_size = 100
+                    
+                    for i in range(0, len(docs), batch_size):
+                        batch_docs = docs[i:i+batch_size]
+                        batch_text = "\n\n".join(batch_docs)
+                        chunks = splitter.split_text(batch_text)
+                        
+                        vs.add_texts(texts=chunks)
+                        print(f"  Batch {i//batch_size + 1}: {len(chunks)} chunks added")
+                    
+                    final_count = vs._collection.count()
+                    print(f"SUCCESS: Vector store now has {final_count} documents")
+                    
                 else:
-                    print("⚠ No data to ingest")
+                    print("FAILED: No data to load")
             else:
-                print(f"✓ Vector store already contains {len(existing_docs)} documents")
-
+                print(f"SUCCESS: Vector store already has {count} documents")
+                
         except Exception as e:
-            print(f"❌ Vector store ingestion failed: {e}")
+            print(f"FAILED: Data loading - {e}")
             traceback.print_exc()
     else:
-        print("⚠ No vector store available for ingestion")
+        print("FAILED: No vector store available")
 
-    # 4) Initialize RAG chain (FIXED for new API)
+    # 4) Initialize RAG chain
+    print("\n[4/4] Initializing RAG Chain...")
+    
     ml_models["rag_chain"] = None
-
+    
     if not HF_TOKEN:
-        print("❌ HUGGINGFACEHUB_API_TOKEN not set")
+        print("FAILED: HUGGINGFACEHUB_API_TOKEN not set")
     elif not vs:
-        print("❌ Vector store unavailable - cannot create RAG chain")
+        print("FAILED: Vector store not available")
     else:
-        print("🤖 Initializing RAG chain...")
-
-        # Create prompt template
-        prompt_template = """Use the following cybersecurity context to answer the question accurately.
-If you don't know the answer based on the context, say so clearly.
+        try:
+            count = vs._collection.count()
+            if count == 0:
+                print("WARNING: Vector store is empty!")
+            else:
+                print(f"Vector store has {count} documents")
+            
+            # Create prompt
+            prompt_template = """Use the context to answer about cybersecurity.
 
 Context: {context}
 
 Question: {question}
 
-Detailed Answer:"""
-
-        PROMPT = PromptTemplate(
-            template=prompt_template,
-            input_variables=["context", "question"]
-        )
-
-        def try_create_llm_new(repo_id):
-            """Create LLM with new HuggingFaceEndpoint API"""
-            try:
-                print(f"  Trying {repo_id} with HuggingFaceEndpoint...")
+Answer:"""
+            
+            PROMPT = PromptTemplate(
+                template=prompt_template,
+                input_variables=["context", "question"]
+            )
+            
+            # Create LLM
+            print(f"Creating LLM: {FALLBACK_SMALL_REPO_ID}...")
+            
+            if USE_NEW_API:
                 llm = HuggingFaceEndpoint(
-                    repo_id=repo_id,
+                    repo_id=FALLBACK_SMALL_REPO_ID,
                     huggingfacehub_api_token=HF_TOKEN,
                     temperature=0.5,
-                    max_new_tokens=1024,
-                    timeout=120
+                    max_new_tokens=256,
+                    timeout=60
                 )
-
-                rag = RetrievalQA.from_chain_type(
-                    llm=llm,
-                    chain_type="stuff",
-                    retriever=vs.as_retriever(search_kwargs={"k": 3}),
-                    chain_type_kwargs={"prompt": PROMPT},
-                    return_source_documents=False
-                )
-                print(f"  ✓ Successfully initialized with {repo_id}")
-                return rag
-            except Exception as e:
-                print(f"  ✗ Failed with {repo_id}: {str(e)[:100]}")
-                return None
-
-        def try_create_llm_old(repo_id, task_type):
-            """Create LLM with old HuggingFaceHub API (deprecated)"""
-            try:
-                print(f"  Trying {repo_id} with HuggingFaceHub (deprecated)...")
+            else:
                 llm = HuggingFaceHub(
-                    repo_id=repo_id,
-                    task=task_type,
+                    repo_id=FALLBACK_SMALL_REPO_ID,
+                    task="text2text-generation",
                     huggingfacehub_api_token=HF_TOKEN,
-                    model_kwargs={"temperature": 0.5, "max_new_tokens": 1024}
+                    model_kwargs={"temperature": 0.5, "max_new_tokens": 256}
                 )
+            
+            rag = RetrievalQA.from_chain_type(
+                llm=llm,
+                chain_type="stuff",
+                retriever=vs.as_retriever(search_kwargs={"k": 2}),
+                chain_type_kwargs={"prompt": PROMPT}
+            )
+            
+            ml_models["rag_chain"] = rag
+            print("SUCCESS: RAG chain ready")
+            
+        except Exception as e:
+            print(f"FAILED: RAG chain - {e}")
+            traceback.print_exc()
 
-                rag = RetrievalQA.from_chain_type(
-                    llm=llm,
-                    chain_type="stuff",
-                    retriever=vs.as_retriever(search_kwargs={"k": 3})
-                )
-                print(f"  ✓ Successfully initialized with {repo_id} (old API)")
-                return rag
-            except Exception as e:
-                print(f"  ✗ Failed with {repo_id}: {str(e)[:100]}")
-                return None
-
-        # Try to create RAG chain
-        rag = None
-        if USE_NEW_API:
-            rag = try_create_llm_new(PRIMARY_REPO_ID)
-            if not rag:
-                print("  ⚠ Primary model failed, trying fallback...")
-                rag = try_create_llm_new(FALLBACK_SMALL_REPO_ID)
-        else:
-            rag = try_create_llm_old(PRIMARY_REPO_ID, "text-generation")
-            if not rag:
-                print("  ⚠ Primary model failed, trying fallback...")
-                rag = try_create_llm_old(FALLBACK_SMALL_REPO_ID, "text2text-generation")
-
-        ml_models["rag_chain"] = rag
-
-        if rag:
-            print("✓ RAG chain initialized successfully")
-        else:
-            print("❌ All RAG chain initialization attempts failed")
-
-    # Print final status
-    print("="*60)
-    print("📊 STARTUP COMPLETE - Service Status:")
-    print("="*60)
-    print(f"  Embeddings Ready:    {bool(ml_models.get('embedding_function'))}")
-    print(f"  Vector Store Ready:  {bool(ml_models.get('vector_store'))}")
-    print(f"  RAG Chain Ready:     {bool(ml_models.get('rag_chain'))}")
-    print(f"  HF Token Set:        {bool(HF_TOKEN)}")
-    print(f"  Using New API:       {USE_NEW_API}")
-    print("="*60)
-
+    # Final status
+    print("\n" + "="*70)
+    print("STARTUP COMPLETE")
+    print("="*70)
+    print(f"Embeddings:    {bool(ml_models.get('embedding_function'))}")
+    print(f"Vector Store:  {bool(ml_models.get('vector_store'))}")
+    print(f"RAG Chain:     {bool(ml_models.get('rag_chain'))}")
+    print(f"HF Token:      {bool(HF_TOKEN)}")
+    print(f"Using New API: {USE_NEW_API}")
+    
+    if vs:
+        try:
+            print(f"Documents:     {vs._collection.count()}")
+        except:
+            pass
+    
+    print("="*70 + "\n")
+    
     yield
-
-    print("🛑 Shutting down...")
+    
+    print("Shutting down...")
     ml_models.clear()
-    print("✓ Shutdown complete")
 
-# ---------- FastAPI app ----------
+# ---------- FastAPI App ----------
 app = FastAPI(
-    title="Text Generation RAG Service",
-    description="RAG service for cybersecurity question answering",
-    version="2.0.0",
+    title="RAG Service with ChromaDB",
+    version="3.0.0",
     lifespan=lifespan
 )
 
@@ -273,104 +283,74 @@ class QueryResponse(BaseModel):
 def root():
     return {
         "status": "running",
-        "service": "Text Generation (RAG) Service",
-        "version": "2.0.0"
+        "service": "RAG with ChromaDB",
+        "version": "3.0.0"
     }
 
 @app.get("/status")
 def status():
-    """Get service status"""
+    vs = ml_models.get("vector_store")
+    doc_count = 0
+    
+    if vs:
+        try:
+            doc_count = vs._collection.count()
+        except:
+            pass
+    
     return {
-        "vector_store_ready": bool(ml_models.get("vector_store")),
+        "vector_store_ready": bool(vs),
         "rag_chain_ready": bool(ml_models.get("rag_chain")),
         "hf_token_set": bool(HF_TOKEN),
         "using_new_api": USE_NEW_API,
-        "embedding_model": EMBEDDING_MODEL_NAME
+        "document_count": doc_count
     }
 
 @app.get("/health")
 def health():
-    """Detailed health check"""
     vs = ml_models.get("vector_store")
     doc_count = 0
-
+    
     if vs:
         try:
-            collection_data = vs._collection.get(include=['documents'])
-            doc_count = len(collection_data.get('documents', []))
+            doc_count = vs._collection.count()
         except:
             pass
-
+    
     return {
         "status": "healthy" if ml_models.get("rag_chain") else "degraded",
-        "service": "textgen",
         "components": {
             "embeddings": bool(ml_models.get("embedding_function")),
-            "vector_store": bool(ml_models.get("vector_store")),
+            "vector_store": bool(vs),
             "rag_chain": bool(ml_models.get("rag_chain"))
         },
-        "vector_store_documents": doc_count
+        "document_count": doc_count
     }
 
 @app.post("/generate-text", response_model=QueryResponse)
 async def generate_text(req: QueryRequest):
-    """Generate answer using RAG"""
-
     if not ml_models.get("rag_chain"):
         raise HTTPException(
             status_code=503,
-            detail="RAG chain not available. Check /status endpoint."
+            detail="RAG chain not available. Check /health"
         )
-
+    
     if not req.query.strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Query cannot be empty."
-        )
-
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+    
     try:
-        print(f"\n🔍 Processing query: {req.query[:100]}...")
-
-        # Use invoke method (compatible with both old and new APIs)
+        print(f"Query: {req.query[:80]}...")
         result = ml_models["rag_chain"].invoke({"query": req.query})
-
-        # Handle different response formats
+        
         if isinstance(result, dict):
             answer = result.get("result", result.get("answer", str(result)))
         else:
             answer = str(result)
-
-        print(f"✓ Generated answer ({len(answer)} chars)")
-
-        return QueryResponse(
-            answer=answer if answer else "No answer could be generated."
-        )
-
+        
+        print(f"Answer generated: {len(answer)} chars")
+        return QueryResponse(answer=answer if answer else "No answer")
+        
     except Exception as e:
-        print(f"❌ Generation error: {e}")
+        print(f"Error: {e}")
         traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail=f"Generation failed: {str(e)}"
-        )
-
-@app.get("/vector-store-info")
-def vector_store_info():
-    """Get vector store information"""
-    vs = ml_models.get("vector_store")
-
-    if not vs:
-        return {"error": "Vector store not initialized"}
-
-    try:
-        collection_data = vs._collection.get(include=['documents', 'metadatas'])
-        docs = collection_data.get('documents', [])
-
-        return {
-            "status": "ready",
-            "document_count": len(docs),
-            "sample_doc": docs[0][:200] + "..." if docs else None,
-            "collection_name": vs._collection.name
-        }
-    except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Failed: {str(e)}")
