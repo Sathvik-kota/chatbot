@@ -497,14 +497,12 @@ def generate_text(req: QueryRequest):
         print("\n--- NEW QUERY RECEIVED ---")
         print(f"Query: {req.query}")
         
-        # Try different invocation methods
+        # --- FIXED INVOCATION LOGIC ---
+        # We MUST use .invoke() because return_source_documents=True
         out_text = None
         source_docs = []
 
-        if hasattr(rag, "run"):
-            # .run is simple, doesn't return sources
-            out_text = rag.run(req.query)
-        elif hasattr(rag, "invoke"):
+        if hasattr(rag, "invoke"):
             # .invoke returns a dict, which should have sources
             res = rag.invoke({"query": req.query})
             if isinstance(res, dict):
@@ -512,8 +510,13 @@ def generate_text(req: QueryRequest):
                 source_docs = res.get("source_documents")
             else:
                 out_text = str(res)
+        elif hasattr(rag, "run"):
+             # This is now a fallback, but it shouldn't be hit
+            print("[WARN] Using .run() fallback, source documents will not be logged.")
+            out_text = rag.run(req.query)
         elif callable(rag):
             # Fallback for older chain types
+            print("[WARN] Using callable() fallback, source documents will not be logged.")
             out_text = rag(req.query)
         else:
             raise HTTPException(status_code=500, detail="RAG chain invocation method not found")
@@ -524,8 +527,12 @@ def generate_text(req: QueryRequest):
             for i, doc in enumerate(source_docs):
                 print(f"  DOC {i+1}: {doc.page_content[:500]}...") # Log first 500 chars
         else:
-            print("[DEBUG] No source documents were returned by the chain.")
+            print("[DEBUG] No source documents were returned by the chain (or .invoke() failed).")
         
+        if out_text is None:
+             print("[ERROR] Failed to extract 'result' from RAG chain response.")
+             raise HTTPException(status_code=500, detail="Failed to get 'result' from RAG chain.")
+
         print(f"Generated Answer: {out_text}")
         print("--- QUERY COMPLETE ---")
         
