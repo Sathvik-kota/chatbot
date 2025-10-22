@@ -223,13 +223,13 @@ def create_local_llm():
     if pipeline is None or AutoTokenizer is None or AutoModelForSeq2SeqLM is None:
         print("[LLM] transformers library not available.")
         return None
-    
+
     try:
         print(f"[LLM] Loading local model: {LOCAL_MODEL_ID}")
-        
+
         # Load tokenizer and model
         tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_ID)
-        
+
         # For T5/Flan-T5 models (seq2seq)
         if "t5" in LOCAL_MODEL_ID.lower():
             model = AutoModelForSeq2SeqLM.from_pretrained(LOCAL_MODEL_ID)
@@ -238,7 +238,7 @@ def create_local_llm():
             # For causal LM models
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text-generation"
-        
+
         # Create pipeline with OPTIMIZED generation parameters
         pipe = pipeline(
             task,
@@ -253,13 +253,13 @@ def create_local_llm():
             no_repeat_ngram_size=3,
             early_stopping=True
         )
-        
+
         # Wrap in LangChain
         llm = HuggingFacePipeline(pipeline=pipe)
-        
+
         print(f"[LLM] Local model loaded successfully: {LOCAL_MODEL_ID}")
         return llm
-        
+
     except Exception as e:
         print(f"[LLM] Failed to load local model: {e}")
         traceback.print_exc()
@@ -270,20 +270,22 @@ def create_rag_chain(llm, vs):
     if llm is None or vs is None:
         print("[RAG] Cannot create chain: llm or vs is None")
         return None
-    
+
     if RetrievalQA is None:
         print("[RAG] RetrievalQA not available")
         return None
-    
+
     try:
-        # SIMPLE and DIRECT prompt template for T5
-        # This format works best with Flan-T5 models
-        template = """Context: {context}
+        # *** FIXED: This new prompt allows the model to ignore irrelevant context ***
+        template = """Use the following context ONLY if it is relevant to the question.
+If the context is not relevant, answer the question using your own knowledge about cybersecurity.
+
+Context: {context}
 
 Question: {question}
 
-Provide a detailed explanation that includes what it is, how it works, and its impact."""
-        
+Answer:"""
+
         prompt = None
         if PromptTemplate is not None:
             try:
@@ -291,12 +293,12 @@ Provide a detailed explanation that includes what it is, how it works, and its i
                 print("[RAG] Created simple prompt template")
             except Exception:
                 traceback.print_exc()
-        
+
         # Create RAG chain
         chain_type_kwargs = {}
         if prompt is not None:
             chain_type_kwargs["prompt"] = prompt
-        
+
         rag = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
@@ -304,10 +306,10 @@ Provide a detailed explanation that includes what it is, how it works, and its i
             chain_type_kwargs=chain_type_kwargs,
             return_source_documents=False
         )
-        
+
         print("[RAG] RAG chain created successfully")
         return rag
-        
+
     except Exception as e:
         print(f"[RAG] Failed to create chain: {e}")
         traceback.print_exc()
@@ -316,10 +318,10 @@ Provide a detailed explanation that includes what it is, how it works, and its i
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("[LIFESPAN] starting up...")
-    
+
     # Embedding
     ml_models["embedding_function"] = create_embedding_function()
-    
+
     # Chroma
     ml_models["vector_store"] = init_chroma(ml_models["embedding_function"])
     vs = ml_models["vector_store"]
@@ -350,11 +352,11 @@ async def lifespan(app: FastAPI):
     # Create local LLM
     print("[LIFESPAN] Loading local LLM (this may take a minute)...")
     ml_models["local_llm"] = create_local_llm()
-    
+
     # Create RAG chain
     if ml_models["local_llm"] is not None and vs is not None:
         ml_models["rag_chain"] = create_rag_chain(ml_models["local_llm"], vs)
-    
+
     print("[LIFESPAN] startup complete:", {
         "vector_store_ready": vs is not None,
         "vector_store_count": vs_count_estimate(vs) if vs is not None else 0,
@@ -362,7 +364,7 @@ async def lifespan(app: FastAPI):
         "rag_chain_ready": ml_models.get("rag_chain") is not None,
         "csv_found": bool(csv_path)
     })
-    
+
     yield
     ml_models.clear()
     print("[LIFESPAN] shutdown complete.")
@@ -430,11 +432,11 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
 def generate_text(req: QueryRequest):
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
-    
+
     rag = ml_models.get("rag_chain")
     if rag is None:
         raise HTTPException(status_code=503, detail="RAG chain not available. Model may still be loading.")
-    
+
     try:
         # Try different invocation methods
         if hasattr(rag, "run"):
@@ -455,3 +457,4 @@ def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn main:app --host 0.0.0.0 --port 8002")
+
