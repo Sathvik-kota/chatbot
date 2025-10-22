@@ -40,6 +40,16 @@ try:
 except Exception:
     LC_HuggingFaceHub = None
 
+# --- NEW IMPORT ---
+try:
+    from langchain.prompts import PromptTemplate
+except Exception:
+    try:
+        from langchain_core.prompts import PromptTemplate
+    except Exception:
+        PromptTemplate = None
+# --------------------
+
 # RetrievalQA import (try usual places)
 try:
     from langchain.chains import RetrievalQA
@@ -453,8 +463,33 @@ def try_create_langchain_llm_and_rag(vs):
         # use a small public model as fallback; specify task to satisfy the pydantic validation
         print(f"[LLM] Trying HuggingFaceHub with {FALLBACK_REPO_ID}")
         llm = LC_HuggingFaceHub(repo_id=FALLBACK_REPO_ID, task="text2text-generation", huggingfacehub_api_token=HF_TOKEN, model_kwargs={"temperature":0.3, "max_new_tokens":512})
+
+        # --- NEW: Define a custom prompt template for the T5 fallback model ---
+        # This matches the prompt format we built for the InferenceClient path
+        template = "context: {context} question: {question}"
+        prompt = None
+        if PromptTemplate is not None:
+            try:
+                prompt = PromptTemplate(template=template, input_variables=["context", "question"])
+                print("[LLM] Created custom prompt template for RetrievalQA.")
+            except Exception:
+                traceback.print_exc()
+                prompt = None
+        # --------------------------------------------------------------------
+
         if RetrievalQA is not None:
-            rag = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=vs.as_retriever())
+            # --- UPDATED: Pass the custom prompt if it was created ---
+            chain_type_kwargs = {}
+            if prompt is not None:
+                chain_type_kwargs["prompt"] = prompt
+
+            rag = RetrievalQA.from_chain_type(
+                llm=llm,
+                chain_type="stuff",
+                retriever=vs.as_retriever(),
+                chain_type_kwargs=chain_type_kwargs
+            )
+            # ----------------------------------------------------------
             print("[LLM] RetrievalQA (HuggingFaceHub) created.")
             return rag
         else:
@@ -628,5 +663,6 @@ def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn textgen_service.main:app --host 0.0.0.0 --port 8002")
+
 
 
