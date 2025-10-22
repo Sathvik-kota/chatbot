@@ -95,10 +95,9 @@ HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
 PRIMARY_REPO_ID = "mistralai/Mixtral-8x7B-Instruct-v0.1"    # may be gated / not hosted for inference
 # *** UPDATED FALLBACK_REPO_ID ***
-# The T5 model is not instruction-tuned.
-# The Flan/Falcon models are 404.
-# Trying 'bloomz' as the next instruction-tuned model.
-FALLBACK_REPO_ID = "bigscience/bloomz-560m"
+# All instruction-tuned models are 404.
+# Reverting to the most basic, universally available text-generation model: gpt2
+FALLBACK_REPO_ID = "gpt2"
 
 TOP_K = 4
 
@@ -466,16 +465,30 @@ def try_create_langchain_llm_and_rag(vs):
         # --- UPDATED: Switched task for the new model type ---
         llm = LC_HuggingFaceHub(repo_id=FALLBACK_REPO_ID, task="text-generation", huggingfacehub_api_token=HF_TOKEN, model_kwargs={"temperature":0.3, "max_new_tokens":512})
 
-        # --- UPDATED: Define a new prompt template for the T5 fallback model ---
-        # This matches the new summarization-style prompt
-        template = """summarize: {context}
+        # --- UPDATED: Dynamic prompt template based on the fallback model ---
+        # This fixes a bug where the T5 prompt was hard-coded.
+        template = ""
+        if "t5" in FALLBACK_REPO_ID.lower():
+            template = """summarize: {context}
 
 Given the context above, {question}"""
+        else:
+            # Default instruction prompt for models like GPT-2, BLOOM, Falcon
+            template = """Use the following context to answer the question concisely.
+
+CONTEXT:
+{context}
+
+QUESTION:
+{question}
+
+Answer:"""
+
         prompt = None
         if PromptTemplate is not None:
             try:
                 prompt = PromptTemplate(template=template, input_variables=["context", "question"])
-                print("[LLM] Created custom prompt template for RetrievalQA.")
+                print(f"[LLM] Created custom prompt template for {FALLBACK_REPO_ID}.")
             except Exception:
                 traceback.print_exc()
                 prompt = None
@@ -667,5 +680,6 @@ def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn textgen_service.main:app --host 0.0.0.0 --port 8002")
+
 
 
