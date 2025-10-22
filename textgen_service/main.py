@@ -85,9 +85,9 @@ HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
 PRIMARY_REPO_ID = "mistralai/Mixtral-8x7B-Instruct-v0.1"    # may be gated / not hosted for inference
 # *** UPDATED FALLBACK_REPO_ID ***
-# Changed from 'google/flan-t5-small' which was causing a 404 error
-# to 'google-t5/t5-small' which is more reliably available.
-FALLBACK_REPO_ID = "google-t5/t5-small"
+# Changed from 'google-t5/t5-small' which is not instruction-tuned
+# to 'google/flan-t5-base' which can follow instructions better.
+FALLBACK_REPO_ID = "google/flan-t5-base"
 
 TOP_K = 4
 
@@ -601,7 +601,7 @@ def generate_text(req: QueryRequest):
                 retriever = vs.as_retriever()
             except Exception:
                 retriever = vs
-            answer = generate_with_inference(client, model_id, retriever, req.query, top_k=TOP_K, max_new_tokens=256)
+            answer = generate_with_inference(.client, model_id, retriever, req.query, top_k=TOP_K, max_new_tokens=256)
             return QueryResponse(answer=str(answer))
         except Exception as e:
             traceback.print_exc()
@@ -628,6 +628,4 @@ def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn textgen_service.main:app --host 0.0.0.0 --port 8002")
-
-
 
