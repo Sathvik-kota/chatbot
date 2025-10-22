@@ -261,7 +261,8 @@ def check_inference_endpoint(repo_id: str, token: str, timeout: int = 8) -> bool
     except Exception:
         return False
 
-def build_prompt_with_context(query: str, docs: list) -> str:
+def build_prompt_with_context(query: str, docs: list, model_id: str = "") -> str:
+    """Builds a prompt, optimizing the format for the specific model_id."""
     ctx_items = []
     for d in docs:
         if hasattr(d, "page_content"):
@@ -271,6 +272,16 @@ def build_prompt_with_context(query: str, docs: list) -> str:
         else:
             ctx_items.append(str(d).strip())
     context = "\n\n---\n\n".join(ctx_items) if ctx_items else ""
+
+    # --- UPDATED: Select prompt format based on model ---
+    # T5 models prefer a "task" format
+    if "t5" in model_id.lower() or "flan" in model_id.lower():
+        if context:
+            return f"question: {query} context: {context}"
+        else:
+            return f"question: {query}"
+
+    # Default to instruction format for models like Mixtral
     prompt = "Use the following context to answer the question concisely.\n\n"
     if context:
         prompt += f"CONTEXT:\n{context}\n\n"
@@ -336,7 +347,8 @@ def generate_with_inference(client, model_id: str, retriever, query: str, top_k:
         docs = []
 
     docs = docs[:top_k] if docs else []
-    prompt = build_prompt_with_context(query, docs)
+    # --- UPDATED: Pass model_id to build the correct prompt ---
+    prompt = build_prompt_with_context(query, docs, model_id)
 
     last_exc = None
     tried = []
@@ -615,4 +627,5 @@ def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn textgen_service.main:app --host 0.0.0.0 --port 8002")
+
 
