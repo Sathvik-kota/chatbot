@@ -516,8 +516,10 @@ def generate_text(req: QueryRequest):
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
     
     rag = ml_models.get("rag_chain")
-    if rag is None:
-        raise HTTPException(status_code=503, detail="RAG chain not available. Model may still be loading.")
+    llm = ml_models.get("local_llm") # Get the raw LLM
+
+    if rag is None or llm is None:
+        raise HTTPException(status_code=503, detail="RAG chain or LLM not available. Model may still be loading.")
     
     try:
         # --- NEW DEBUGGING LOGIC ---
@@ -525,36 +527,60 @@ def generate_text(req: QueryRequest):
         print(f"Query: {req.query}")
         
         # --- FIXED INVOCATION LOGIC ---
-        # We MUST use .invoke() because return_source_documents=True
         out_text = None
         source_docs = []
+        
+        # --- *** NEW ADAPTIVE LOGIC *** ---
+        # If it's a "What is" question, bypass RAG and just use the LLM's own knowledge.
+        # This prevents context-poisoning for definitions.
+        query_lower = req.query.strip().lower()
+        if query_lower.startswith("what is") or query_lower.startswith("what are"):
+            print("[INFO] Definitional question detected. Bypassing RAG to use model's internal knowledge.")
+            if hasattr(llm, "invoke"):
+                out_text = llm.invoke(req.query)
+            elif hasattr(llm, "run"):
+                out_text = llm.run(req.query)
+            elif callable(llm):
+                out_text = llm(req.query)
+            
+            # The raw llm.invoke() on a HuggingFacePipeline often returns the full text
+            if isinstance(out_text, list) and out_text:
+                if isinstance(out_text[0], dict):
+                    out_text = out_text[0].get('generated_text')
+            
+            out_text = str(out_text)
 
-        if hasattr(rag, "invoke"):
-            # .invoke returns a dict, which should have sources
-            res = rag.invoke({"query": req.query})
-            if isinstance(res, dict):
-                out_text = res.get("result")
-                source_docs = res.get("source_documents")
-            else:
-                out_text = str(res)
-        elif hasattr(rag, "run"):
-             # This is now a fallback, but it shouldn't be hit
-            print("[WARN] Using .run() fallback, source documents will not be logged.")
-            out_text = rag.run(req.query)
-        elif callable(rag):
-            # Fallback for older chain types
-            print("[WARN] Using callable() fallback, source documents will not be logged.")
-            out_text = rag(req.query)
         else:
-            raise HTTPException(status_code=500, detail="RAG chain invocation method not found")
+            print("[INFO] Specific question detected. Using RAG chain.")
+            # We MUST use .invoke() because return_source_documents=True
+            if hasattr(rag, "invoke"):
+                # .invoke returns a dict, which should have sources
+                res = rag.invoke({"query": req.query})
+                if isinstance(res, dict):
+                    out_text = res.get("result")
+                    source_docs = res.get("source_documents")
+                else:
+                    out_text = str(res)
+            elif hasattr(rag, "run"):
+                 # This is now a fallback, but it shouldn't be hit
+                print("[WARN] Using .run() fallback, source documents will not be logged.")
+                out_text = rag.run(req.query)
+            elif callable(rag):
+                # Fallback for older chain types
+                print("[WARN] Using callable() fallback, source documents will not be logged.")
+                out_text = rag(req.query)
+            else:
+                raise HTTPException(status_code=500, detail="RAG chain invocation method not found")
 
-        # --- LOG THE RETRIEVED CONTEXT ---
+        # --- LOG THE RETRIEVED CONTEXT (if RAG was used) ---
         if source_docs:
             print(f"[DEBUG] Retrieved {len(source_docs)} source document(s):")
             for i, doc in enumerate(source_docs):
                 print(f"  DOC {i+1}: {doc.page_content[:500]}...") # Log first 500 chars
         else:
-            print("[DEBUG] No source documents were returned by the chain (or .invoke() failed).")
+            # This is now expected for "what is" questions
+            if not (query_lower.startswith("what is") or query_lower.startswith("what are")):
+                print("[DEBUG] No source documents were returned by the chain (or .invoke() failed).")
         
         if out_text is None:
              print("[ERROR] Failed to extract 'result' from RAG chain response.")
