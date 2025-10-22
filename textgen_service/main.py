@@ -321,16 +321,24 @@ def create_rag_chain(llm, vs):
         return None
     
     try:
-        # --- *** SIMPLIFIED PROMPT *** ---
-        # This is a much more direct, simple prompt that flan-t5
-        # is more likely to follow correctly.
-        template = """Answer the following question based on the context provided.
-If the context is not relevant, answer from your own knowledge.
+        # --- *** FEW-SHOT PROMPT *** ---
+        # We give the model EXAMPLES of how to behave. This is a very
+        # powerful way to get the correct behavior from flan-t5.
+        template = """You are a cybersecurity expert. Follow the examples.
 
+Example 1:
+Context: Attack Type: Malware. Attack Severity: Medium. Threat Intelligence: Contained.
+Question: What is SQL Injection?
+Answer: SQL Injection (SQLi) is a type of cyberattack where an attacker inserts malicious SQL code into queries to manipulate a database.
+
+Example 2:
+Context: Attack Type: DDoS. Attack Severity: High. Threat Intelligence: Contained. Response Action: Eradicated.
+Question: What was the response action for the DDoS attack?
+Answer: The response action for the DDoS attack was: Eradicated.
+
+---
 Context: {context}
-
 Question: {question}
-
 Answer:"""
         
         prompt = None
