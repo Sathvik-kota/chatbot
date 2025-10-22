@@ -95,9 +95,10 @@ HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
 PRIMARY_REPO_ID = "mistralai/Mixtral-8x7B-Instruct-v0.1"    # may be gated / not hosted for inference
 # *** UPDATED FALLBACK_REPO_ID ***
-# All instruction-tuned models (flan, falcon) are 404.
-# We MUST go back to the only model that was available.
-FALLBACK_REPO_ID = "google-t5/t5-small"
+# The T5 model is not instruction-tuned.
+# The Flan/Falcon models are 404.
+# Trying 'bloomz' as the next instruction-tuned model.
+FALLBACK_REPO_ID = "bigscience/bloomz-560m"
 
 TOP_K = 4
 
@@ -462,8 +463,8 @@ def try_create_langchain_llm_and_rag(vs):
     try:
         # use a small public model as fallback; specify task to satisfy the pydantic validation
         print(f"[LLM] Trying HuggingFaceHub with {FALLBACK_REPO_ID}")
-        # --- UPDATED: Switched task back to T5's task ---
-        llm = LC_HuggingFaceHub(repo_id=FALLBACK_REPO_ID, task="text2text-generation", huggingfacehub_api_token=HF_TOKEN, model_kwargs={"temperature":0.3, "max_new_tokens":512})
+        # --- UPDATED: Switched task for the new model type ---
+        llm = LC_HuggingFaceHub(repo_id=FALLBACK_REPO_ID, task="text-generation", huggingfacehub_api_token=HF_TOKEN, model_kwargs={"temperature":0.3, "max_new_tokens":512})
 
         # --- UPDATED: Define a new prompt template for the T5 fallback model ---
         # This matches the new summarization-style prompt
@@ -666,4 +667,5 @@ def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn textgen_service.main:app --host 0.0.0.0 --port 8002")
+
 
