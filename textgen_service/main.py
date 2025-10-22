@@ -95,9 +95,9 @@ HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
 PRIMARY_REPO_ID = "mistralai/Mixtral-8x7B-Instruct-v0.1"    # may be gated / not hosted for inference
 # *** UPDATED FALLBACK_REPO_ID ***
-# Switched back to 'google-t5/t5-small' which we know is available.
-# We will fix the prompt to get a better answer from it.
-FALLBACK_REPO_ID = "google-t5/t5-small"
+# We are trying flan-t5-small again, as we MUST use an
+# instruction-tuned model, which google-t5/t5-small is not.
+FALLBACK_REPO_ID = "google/flan-t5-small"
 
 TOP_K = 4
 
@@ -281,16 +281,22 @@ def build_prompt_with_context(query: str, docs: list, model_id: str = "") -> str
             ctx_items.append(str(d["page_content"]).strip())
         else:
             ctx_items.append(str(d).strip())
-    context = "\n\n---\n\n".join(ctx_items) if ctx_items else ""
+    context = "\n\n---\n\n".join(ctx_items) if ctx_items else "No context provided."
 
     # --- UPDATED: Select prompt format based on model ---
     # T5 models prefer a "task" format
     if "t5" in model_id.lower():
-        # --- UPDATED: Use a Q&A format for non-instruct T5 ---
-        if context:
-            return f"Context: {context}\n\nQ: {query}\n\nA:"
-        else:
-            return f"Q: {query}\n\nA:"
+        # --- UPDATED: Use a very explicit Q&A instruction format ---
+        return f"""Answer the following question based on the context provided.
+
+Context:
+{context}
+
+Question:
+{query}
+
+Answer:
+"""
 
     # Default to instruction format for models like Mixtral
     prompt = "Use the following context to answer the question concisely.\n\n"
@@ -465,8 +471,17 @@ def try_create_langchain_llm_and_rag(vs):
         llm = LC_HuggingFaceHub(repo_id=FALLBACK_REPO_ID, task="text2text-generation", huggingfacehub_api_token=HF_TOKEN, model_kwargs={"temperature":0.3, "max_new_tokens":512})
 
         # --- NEW: Define a custom prompt template for the T5 fallback model ---
-        # This matches the new Q&A prompt format
-        template = "Context: {context}\n\nQ: {question}\n\nA:"
+        # This matches the new explicit instruction prompt
+        template = """Answer the following question based on the context provided.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
         prompt = None
         if PromptTemplate is not None:
             try:
@@ -653,7 +668,7 @@ def generate_text(req: QueryRequest):
                 res = rag.invoke({"query": req.query})
                 return QueryResponse(answer=str(res.get("result") if isinstance(res, dict) else res))
             else:
-                out = rag(req.query) if callable(rag) else None
+                out = rag(req.GagQueryRequest) if callable(rag) else None
                 return QueryResponse(answer=str(out))
         except Exception as e:
             traceback.print_exc()
@@ -663,7 +678,4 @@ def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn textgen_service.main:app --host 0.0.0.0 --port 8002")
-
-
-
 
