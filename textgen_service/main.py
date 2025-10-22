@@ -14,7 +14,7 @@ from langchain.chains import RetrievalQA
 ROOT_DIR = os.path.dirname(__file__) or os.getcwd()
 CHROMA_DB_PATH = os.path.join(ROOT_DIR, "chroma_db")
 DOCUMENTS_DIR = os.path.join(ROOT_DIR, "documents")
-KNOWLEDGE_FILE_PATH = os.path.join(DOCUMENTS_DIR, "cic-ids2018-sampled-5k.csv")  # your uploaded 5k CSV
+KNOWLEDGE_FILE_PATH = os.path.join(DOCUMENTS_DIR, "cic-ids2018-sampled-5k.csv")
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
@@ -80,8 +80,10 @@ async def lifespan(app: FastAPI):
     vs = ml_models.get("vector_store")
     if vs is not None:
         try:
-            # Check if collection is empty
-            if vs._collection.count() == 0:
+            # FIX #1: Use .count() instead of ._collection.get()
+            collection_count = vs._collection.count()
+            
+            if collection_count == 0:
                 print("LIFESPAN: Vector store is empty, attempting ingestion...")
                 df = load_csv_and_sample()
                 if df is not None:
@@ -98,16 +100,16 @@ async def lifespan(app: FastAPI):
                         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
                         chunks = splitter.split_text("\n\n".join(docs))
                         vs.add_texts(texts=chunks)
-                        # Only persist if it's a persistent client
-                        if hasattr(vs, 'persist'):
-                             vs.persist()
+                        
+                        # FIX #2: persist() is deprecated in chromadb 0.5+, no longer needed
+                        # Data is auto-persisted with persist_directory
                         print(f"LIFESPAN: ingested {len(docs)} docs -> {len(chunks)} chunks.")
                     else:
                         print(f"LIFESPAN: CSV missing required columns (need {required_cols}); skipping ingestion.")
                 else:
                     print("LIFESPAN: CSV not loaded; skipping ingestion.")
             else:
-                print(f"LIFESPAN: vector store already has {vs._collection.count()} items; skipping ingestion.")
+                print(f"LIFESPAN: vector store already has {collection_count} items; skipping ingestion.")
         except Exception:
             print("LIFESPAN: vector store ingestion/check failed.")
             traceback.print_exc()
@@ -145,9 +147,6 @@ async def lifespan(app: FastAPI):
             if rag is None:
                 print("LIFESPAN: Primary model failed, trying fallback...")
                 rag = try_create_llm(FALLBACK_SMALL_REPO_ID, task_type="text2text-generation")
-            
-            if rag is None:
-                print("LIFESPAN: All RAG models failed to initialize.")
             
             ml_models["rag_chain"] = rag
 
@@ -191,20 +190,15 @@ async def generate_text(req: QueryRequest):
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
     
     try:
-        # --- UPDATED CODE ---
-        # .run() is deprecated. Use .invoke() instead.
-        # The input for RetrievalQA is a dictionary with a "query" key.
-        # The output is also a dictionary, with the answer in the "result" key.
-        
+        # FIX #3: Use invoke() instead of deprecated run()
         print(f"Invoking RAG chain with query: {req.query}")
-        chain_input = {"query": req.query}
-        out = rag_chain.invoke(chain_input)
+        result = rag_chain.invoke({"query": req.query})
         
-        answer = out.get("result", "No answer generated.")
+        # Extract answer from result dict
+        answer = result.get("result", "No answer generated.")
         print(f"RAG chain generated answer: {answer}")
         
         return QueryResponse(answer=str(answer))
-        # --- END OF UPDATE ---
 
     except Exception as e:
         print("Generation error:")
