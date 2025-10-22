@@ -283,7 +283,8 @@ def _parse_inference_response(gen, method_name: str) -> str:
         if isinstance(gen, list):
             first = gen[0]
             if isinstance(first, dict):
-                for key in ("generated_text", "generated_texts", "text", "output", "result"):
+                # --- UPDATED: Added 'translation_text' for T5 models ---
+                for key in ("generated_text", "generated_texts", "text", "output", "result", "translation_text"):
                     if key in first:
                         val = first[key]
                         if isinstance(val, list):
@@ -293,7 +294,8 @@ def _parse_inference_response(gen, method_name: str) -> str:
             else:
                 return str(first)
         if isinstance(gen, dict):
-            for key in ("generated_text", "generated_texts", "text", "output", "result"):
+            # --- UPDATED: Added 'translation_text' for T5 models ---
+            for key in ("generated_text", "generated_texts", "text", "output", "result", "translation_text"):
                 if key in gen:
                     val = gen[key]
                     if isinstance(val, list):
@@ -613,3 +615,4 @@ def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn textgen_service.main:app --host 0.0.0.0 --port 8002")
+
