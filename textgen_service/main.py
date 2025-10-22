@@ -3,21 +3,25 @@
 Robust TextGen (RAG) service tuned to:
   /content/project/textgen_service/ai_cybersecurity_dataset-sampled-5k.csv
 
-Features:
- - Safe imports (works across several langchain / chroma versions)
- - /upload-csv to upload CSV (optional)
- - /force-ingest to ingest CSV into Chroma (batching + robust add methods)
- - /status to inspect readiness
- - /generate-text to run the RAG chain (if initialized)
+This version:
+ - Keeps robust/langchain-chroma import fallbacks
+ - Uses huggingface_hub.InferenceClient for generation (Mistral / Mixtral)
+ - Retains endpoints: /status, /upload-csv, /force-ingest, /generate-text
+ - Safe, defensive code paths for many langchain / chroma versions
 """
 
 import os
 import traceback
 import pandas as pd
+from typing import Optional, List, Any
 from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
-from typing import Optional
+
+# -------------------------
+# HF Inference Client (for Mistral/Mixtral)
+# -------------------------
+from huggingface_hub import InferenceClient
 
 # -------------------------
 # Try imports (robust)
@@ -28,7 +32,7 @@ except Exception:
     SentenceTransformerEmbeddings = None
 
 try:
-    from langchain_community.llms import HuggingFaceHub
+    from langchain_community.llms import HuggingFaceHub  # kept as optional fallback
 except Exception:
     HuggingFaceHub = None
 
@@ -61,7 +65,7 @@ if RecursiveCharacterTextSplitter is None:
         def __init__(self, chunk_size=1000, chunk_overlap=100):
             self.chunk_size = chunk_size
             self.chunk_overlap = chunk_overlap
-        def split_text(self, text):
+        def split_text(self, text: str):
             chunks = []
             i, n = 0, len(text)
             while i < n:
@@ -76,16 +80,15 @@ ROOT_DIR = os.path.dirname(__file__) or os.getcwd()
 CHROMA_DB_PATH = os.path.join(ROOT_DIR, "chroma_db")
 DOCUMENTS_DIR = os.path.join(ROOT_DIR, "documents")
 
-# EXACT path you reported
+# Exact path user provided earlier
 HARDCODED_CSV_PATH = "/content/project/textgen_service/ai_cybersecurity_dataset-sampled-5k.csv"
-
-# Also look for these common names/locations
 DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 HF_TOKEN = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
-PRIMARY_REPO_ID = "mistralai/Mixtral-8x7B-Instruct-v0.1"
+# Model to call via InferenceClient (change via env if you wish)
+PRIMARY_REPO_ID = os.getenv("RAG_MODEL_ID", "mistralai/Mixtral-8x7B-Instruct-v0.1")
 FALLBACK_SMALL_REPO_ID = "google/flan-t5-small"
 
 # -------------------------
@@ -94,14 +97,15 @@ FALLBACK_SMALL_REPO_ID = "google/flan-t5-small"
 ml_models = {
     "embedding_function": None,
     "vector_store": None,
-    "rag_chain": None
+    "rag_chain": None,   # will hold RAGWrapper instance or None
+    "hf_inference_client": None
 }
 
 # -------------------------
 # Helper functions
 # -------------------------
 def find_csv_path(basename: str = DEFAULT_CSV_BASENAME) -> Optional[str]:
-    """Look for CSV in several likely locations (including the exact path you gave)."""
+    """Look for CSV in several likely locations (including the exact path)."""
     candidates = [
         HARDCODED_CSV_PATH,
         os.path.join(DOCUMENTS_DIR, basename),
@@ -199,7 +203,7 @@ def vs_count_estimate(vs) -> int:
         traceback.print_exc()
     return 0
 
-def _try_add_texts(vs, texts):
+def _try_add_texts(vs, texts: List[str]):
     """Try a few add APIs and return (ok, method)."""
     # 1) add_texts
     try:
@@ -258,31 +262,143 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs:int=500):
         traceback.print_exc()
     return True, {"method": method, "docs_added": total_added}
 
-def try_init_llm_and_rag(vs):
-    """Create LLM (HuggingFaceHub) and RetrievalQA. Returns rag or None."""
-    if HuggingFaceHub is None:
-        print("[LLM] HuggingFaceHub import not available.")
-        return None
-    if RetrievalQA is None:
-        print("[LLM] RetrievalQA import not available.")
-        return None
-    if not HF_TOKEN:
-        print("[LLM] HF token not set.")
-        return None
+# -------------------------
+# HF InferenceClient RAG wrapper
+# -------------------------
+def extract_text_from_inference_response(resp: Any) -> str:
+    """
+    Normalize the InferenceClient.text_generation response.
+    It can be dict, list, or other forms depending on hf-hub version.
+    """
+    try:
+        if resp is None:
+            return ""
+        # If it's dict with 'generated_text'
+        if isinstance(resp, dict):
+            # some versions: {'generated_text': '...'}
+            if "generated_text" in resp:
+                return resp["generated_text"]
+            # or {'generated_texts': [...]}
+            if "generated_texts" in resp and isinstance(resp["generated_texts"], list) and resp["generated_texts"]:
+                return resp["generated_texts"][0]
+            # fallback: str(resp)
+            return str(resp)
+        # If it's a list of dicts
+        if isinstance(resp, list) and len(resp) > 0:
+            first = resp[0]
+            if isinstance(first, dict) and "generated_text" in first:
+                return first["generated_text"]
+            return str(first)
+        # otherwise fallback to string cast
+        return str(resp)
+    except Exception:
+        traceback.print_exc()
+        return str(resp)
 
-    def make_rag(repo_id, task):
+class RAGWrapperInference:
+    """
+    Simple RAG wrapper that:
+     - retrieves relevant docs via vectorstore retriever (if available)
+     - constructs a prompt with context + question
+     - calls huggingface_hub.InferenceClient.text_generation
+    """
+    def __init__(self, vectorstore, hf_client: InferenceClient, max_context_chars: int = 7000):
+        self.vs = vectorstore
+        self.client = hf_client
+        self.max_context_chars = max_context_chars
+
+    def _retrieve_context(self, query: str, top_k: int = 4) -> str:
+        # Try as_retriever API
         try:
-            llm = HuggingFaceHub(repo_id=repo_id, task=task, huggingfacehub_api_token=HF_TOKEN, model_kwargs={"temperature":0.3, "max_new_tokens":512})
-            rag = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=vs.as_retriever())
-            return rag
+            if hasattr(self.vs, "as_retriever"):
+                retr = self.vs.as_retriever()
+                # many retrievers expect .get_relevant_documents
+                if hasattr(retr, "get_relevant_documents"):
+                    docs = retr.get_relevant_documents(query)
+                elif hasattr(retr, "get_relevant_items"):
+                    docs = retr.get_relevant_items(query)
+                else:
+                    docs = []
+            elif hasattr(self.vs, "similarity_search"):
+                docs = self.vs.similarity_search(query, k=top_k)
+            else:
+                docs = []
+            # Normalize content
+            contents = []
+            for d in (docs or []):
+                try:
+                    c = getattr(d, "page_content", None) or d.get("page_content") if isinstance(d, dict) else str(d)
+                except Exception:
+                    c = str(d)
+                if c:
+                    contents.append(c)
+            ctx = "\n\n".join(contents[:top_k])
+            # trim to max_context_chars (keep the end)
+            if len(ctx) > self.max_context_chars:
+                ctx = ctx[-self.max_context_chars:]
+            return ctx
         except Exception:
             traceback.print_exc()
-            return None
+            return ""
 
-    rag = make_rag(PRIMARY_REPO_ID, "text-generation")
-    if rag is not None:
-        return rag
-    return make_rag(FALLBACK_SMALL_REPO_ID, "text2text-generation")
+    def run(self, query: str) -> str:
+        context = self._retrieve_context(query)
+        # Build prompt. Use a clear instruction.
+        prompt = (
+            "You are an assistant answering cybersecurity questions using the provided context.\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question: {query}\n\nAnswer concisely and clearly:"
+        )
+        try:
+            # Call InferenceClient.text_generation (may return dict/list)
+            resp = self.client.text_generation(prompt, max_new_tokens=512)
+            out = extract_text_from_inference_response(resp)
+            return out
+        except Exception:
+            # try a lower-level call (some hf-hub versions have .pipeline or .generate)
+            traceback.print_exc()
+            try:
+                resp2 = self.client.generate(prompt, max_new_tokens=512)  # older/newer fallback
+                return extract_text_from_inference_response(resp2)
+            except Exception:
+                traceback.print_exc()
+                raise
+
+# -------------------------
+# Try initialize HF Inference client + RAG
+# This will be called from lifespan below (defensive)
+# -------------------------
+def try_init_inference_rag(vs) -> Optional[RAGWrapperInference]:
+    if vs is None:
+        print("[LLM] Vector store missing; cannot initialize RAG.")
+        return None
+    if not HF_TOKEN:
+        print("[LLM] HF token not set; cannot initialize RAG.")
+        return None
+
+    # Try primary model via InferenceClient
+    try:
+        print(f"[LLM] Creating InferenceClient for model: {PRIMARY_REPO_ID}")
+        client = InferenceClient(model=PRIMARY_REPO_ID, token=HF_TOKEN)
+        wrapper = RAGWrapperInference(vs, client)
+        print("[LLM] InferenceClient created for PRIMARY_REPO_ID.")
+        ml_models["hf_inference_client"] = client
+        return wrapper
+    except Exception:
+        traceback.print_exc()
+
+    # Try fallback small model
+    try:
+        print(f"[LLM] Attempting fallback InferenceClient for model: {FALLBACK_SMALL_REPO_ID}")
+        client2 = InferenceClient(model=FALLBACK_SMALL_REPO_ID, token=HF_TOKEN)
+        wrapper2 = RAGWrapperInference(vs, client2)
+        ml_models["hf_inference_client"] = client2
+        print("[LLM] InferenceClient created for FALLBACK_SMALL_REPO_ID.")
+        return wrapper2
+    except Exception:
+        traceback.print_exc()
+
+    return None
 
 # -------------------------
 # FastAPI lifespan
@@ -327,13 +443,13 @@ async def lifespan(app: FastAPI):
     else:
         print("[LIFESPAN] No vector store; skipping ingestion.")
 
-    # try LLM/RAG initialization
+    # init HF InferenceClient + RAG wrapper
     ml_models["rag_chain"] = None
     if ml_models.get("vector_store") is not None and HF_TOKEN:
-        rag = try_init_llm_and_rag(ml_models["vector_store"])
+        rag = try_init_inference_rag(ml_models["vector_store"])
         if rag:
             ml_models["rag_chain"] = rag
-            print("[LIFESPAN] RAG chain initialized.")
+            print("[LIFESPAN] RAG chain (InferenceClient-based) initialized.")
         else:
             print("[LIFESPAN] RAG chain initialization failed.")
     else:
@@ -437,22 +553,21 @@ def generate_text(req: QueryRequest):
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
     try:
         rag = ml_models["rag_chain"]
-        out = None
-        # try run -> invoke -> fallback
-        try:
-            if hasattr(rag, "run"):
-                out = rag.run(req.query)
-            elif hasattr(rag, "invoke"):
-                res = rag.invoke({"query": req.query})
-                out = res.get("result") if isinstance(res, dict) else res
-            else:
-                out = rag(req.query) if callable(rag) else None
-        except Exception:
-            traceback.print_exc()
-            if hasattr(rag, "invoke"):
-                res = rag.invoke({"query": req.query})
-                out = res.get("result") if isinstance(res, dict) else res
-            else:
+        # Preferred interface: run(query)
+        if hasattr(rag, "run"):
+            out = rag.run(req.query)
+        else:
+            # last-resort try different interfaces
+            try:
+                if hasattr(rag, "invoke"):
+                    res = rag.invoke({"query": req.query})
+                    out = res.get("result") if isinstance(res, dict) else res
+                elif callable(rag):
+                    out = rag(req.query)
+                else:
+                    raise RuntimeError("RAG object has no runnable interface")
+            except Exception:
+                traceback.print_exc()
                 raise
         return QueryResponse(answer=str(out) if out is not None else "No answer generated.")
     except Exception as e:
