@@ -277,7 +277,8 @@ def build_prompt_with_context(query: str, docs: list, model_id: str = "") -> str
     # T5 models prefer a "task" format
     if "t5" in model_id.lower() or "flan" in model_id.lower():
         if context:
-            return f"question: {query} context: {context}"
+            # --- UPDATED: Put context first, question last ---
+            return f"context: {context} question: {query}"
         else:
             return f"question: {query}"
 
@@ -627,5 +628,6 @@ def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn textgen_service.main:app --host 0.0.0.0 --port 8002")
+
 
 
