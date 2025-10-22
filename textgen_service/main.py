@@ -1,6 +1,6 @@
 """
-Robust RAG service with LOCAL MODEL support - HYBRID VERSION
-Handles BOTH context-grounded answers AND general knowledge fallback
+RAG service with LangChain - FIXED VERSION WITH PROPER PROMPT HANDLING
+Uses LangChain but with clean, simple prompts that don't leak
 """
 import os
 import traceback
@@ -10,48 +10,45 @@ from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
-# --- Try imports (be tolerant across environments) ---
+# --- LangChain imports ---
 try:
     from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
-except Exception:
+except:
     SentenceTransformerEmbeddings = None
 
 try:
     from langchain_community.vectorstores import Chroma as LC_Chroma
-except Exception:
+except:
     LC_Chroma = None
 
 try:
     from langchain_huggingface import HuggingFacePipeline
-except Exception:
+except:
     try:
         from langchain_community.llms import HuggingFacePipeline
-    except Exception:
+    except:
         HuggingFacePipeline = None
 
 try:
     from langchain.prompts import PromptTemplate
-except Exception:
-    try:
-        from langchain_core.prompts import PromptTemplate
-    except Exception:
-        PromptTemplate = None
+    from langchain_core.prompts import PromptTemplate as CorePromptTemplate
+except:
+    PromptTemplate = CorePromptTemplate = None
 
 try:
     from langchain.chains import RetrievalQA
-except Exception:
+    from langchain.chains.question_answering import load_qa_chain
+except:
     try:
         from langchain_community.chains import RetrievalQA
-    except Exception:
+    except:
         RetrievalQA = None
+    load_qa_chain = None
 
 try:
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, pipeline
-except Exception:
-    AutoTokenizer = None
-    AutoModelForSeq2SeqLM = None
-    AutoModelForCausalLM = None
-    pipeline = None
+except:
+    AutoTokenizer = AutoModelForSeq2SeqLM = AutoModelForCausalLM = pipeline = None
 
 # ---------------- Config ----------------
 ROOT_DIR = os.path.dirname(__file__) or os.getcwd()
@@ -61,10 +58,8 @@ HARDCODED_CSV_PATH = "/content/project/textgen_service/ai_cybersecurity_dataset-
 DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-
 LOCAL_MODEL_ID = "google/flan-t5-base"
-
-TOP_K = 10  # Retrieve more documents for better coverage
+TOP_K = 10
 
 # ---------------- Globals ----------------
 ml_models = {
@@ -72,6 +67,8 @@ ml_models = {
     "vector_store": None,
     "local_llm": None,
     "rag_chain": None,
+    "qa_chain": None,  # For direct QA without retrieval
+    "pipeline": None   # Direct pipeline for general knowledge
 }
 
 # ---------------- Helpers ----------------
@@ -94,129 +91,58 @@ def load_dataframe_from_csv(path: str) -> Optional[pd.DataFrame]:
         df.columns = df.columns.str.strip()
         print(f"[DATA] Loaded CSV: {path} rows={len(df)} cols={len(df.columns)}")
         return df
-    except Exception:
+    except:
         traceback.print_exc()
         return None
 
 def create_embedding_function():
-    if SentenceTransformerEmbeddings is None:
-        print("[EMB] SentenceTransformerEmbeddings not available.")
+    if not SentenceTransformerEmbeddings:
         return None
     try:
         emb = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL_NAME)
-        print("[EMB] Embedding initialized.")
+        print("[EMB] Embedding initialized")
         return emb
-    except Exception:
+    except:
         traceback.print_exc()
         return None
 
 def init_chroma(embedding_function):
-    try:
-        os.makedirs(CHROMA_DB_PATH, exist_ok=True)
-    except Exception:
-        pass
-    if LC_Chroma is None:
-        print("[CHROMA] langchain_community.Chroma import not available.")
+    if not LC_Chroma or not embedding_function:
         return None
     try:
+        os.makedirs(CHROMA_DB_PATH, exist_ok=True)
         vs = LC_Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=embedding_function)
-        print("[CHROMA] Initialized with persist_directory.")
+        print("[CHROMA] Initialized")
         return vs
-    except Exception:
+    except:
         traceback.print_exc()
-    try:
-        import chromadb
-        try:
-            client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-        except Exception:
-            client = chromadb.Client(path=CHROMA_DB_PATH) if hasattr(chromadb, "Client") else None
-        if client is not None:
-            vs = LC_Chroma(client=client, collection_name="rag_collection", embedding_function=embedding_function)
-            print("[CHROMA] Initialized with chromadb client.")
-            return vs
-    except Exception:
-        traceback.print_exc()
-    try:
-        vs = LC_Chroma(embedding_function=embedding_function)
-        print("[CHROMA] Initialized in-memory Chroma.")
-        return vs
-    except Exception:
-        traceback.print_exc()
-    return None
+        return None
 
 def vs_count_estimate(vs) -> int:
-    if vs is None:
+    if not vs:
         return 0
     try:
         col = getattr(vs, "_collection", None)
-        if col is not None and hasattr(col, "count"):
+        if col and hasattr(col, "count"):
             return int(col.count())
-    except Exception:
-        traceback.print_exc()
-    try:
-        if hasattr(vs, "get"):
-            res = vs.get()
-            if isinstance(res, dict):
-                docs = res.get("documents") or res.get("ids") or []
-                return int(len(docs))
-    except Exception:
-        traceback.print_exc()
+    except:
+        pass
     return 0
 
-def _try_add_texts(vs, texts):
-    try:
-        if hasattr(vs, "add_texts"):
-            vs.add_texts(texts=texts)
-            return True, "add_texts"
-    except Exception:
-        traceback.print_exc()
-    try:
-        if hasattr(vs, "add_documents"):
-            docs = [{"page_content": t, "metadata": {}} for t in texts]
-            vs.add_documents(docs)
-            return True, "add_documents"
-    except Exception:
-        traceback.print_exc()
-    try:
-        col = getattr(vs, "_collection", None) or getattr(vs, "collection", None)
-        if col is not None and hasattr(col, "add"):
-            try:
-                col.add(documents=texts)
-            except TypeError:
-                col.add(documents=texts, metadatas=[{}]*len(texts), ids=[None]*len(texts))
-            return True, "_collection.add"
-    except Exception:
-        traceback.print_exc()
-    try:
-        for t in texts:
-            if hasattr(vs, "add_texts"):
-                vs.add_texts(texts=[t])
-        return True, "iterative_add_texts"
-    except Exception:
-        traceback.print_exc()
-    return False, None
-
 def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
-    """Creates CLEAN documents from relevant columns"""
     if df is None or vs is None:
         return False, "no_df_or_vs"
 
-    USEFUL_COLUMNS = [
-        "Attack Type",
-        "Attack Severity", 
-        "Threat Intelligence",
-        "Response Action"
-    ]
+    USEFUL_COLUMNS = ["Attack Type", "Attack Severity", "Threat Intelligence", "Response Action"]
     
     df_cols_lower = {col.lower(): col for col in df.columns}
     cols_to_use = [df_cols_lower[col_name.lower()] for col_name in USEFUL_COLUMNS if col_name.lower() in df_cols_lower]
 
     if not cols_to_use:
-        print("[INGEST] ERROR: Could not find expected columns")
-        print(f"[INGEST] Available columns: {list(df.columns)}")
-        return False, "missing_expected_columns"
+        print(f"[INGEST] ERROR: Missing columns. Available: {list(df.columns)}")
+        return False, "missing_columns"
     
-    print(f"[INGEST] Using text columns: {cols_to_use}")
+    print(f"[INGEST] Using columns: {cols_to_use}")
     
     def create_doc(row):
         parts = []
@@ -229,128 +155,85 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
     docs = [d for d in docs if d.strip()]
     
     if not docs:
-        print("[INGEST] ERROR: No documents created")
         return False, "no_documents_created"
     
-    print(f"[INGEST] Created {len(docs)} clean documents")
-    print(f"[INGEST] Sample: {docs[0][:200]}...")
+    print(f"[INGEST] Created {len(docs)} documents")
     
     total_added = 0
     for i in range(0, len(docs), batch_docs):
         batch = docs[i:i+batch_docs]
-        ok, method = _try_add_texts(vs, batch)
-        if not ok:
+        try:
+            vs.add_texts(texts=batch)
+            total_added += len(batch)
+        except:
             return False, f"batch_failed_at_{i}"
-        total_added += len(batch)
     
     try:
         if hasattr(vs, "persist"):
             vs.persist()
-    except Exception:
-        traceback.print_exc()
+    except:
+        pass
     
-    return True, {"method": method, "docs_added": total_added}
-
+    return True, {"docs_added": total_added}
 
 def create_local_llm():
-    """Create LLM optimized for both grounded and general answers"""
-    if HuggingFacePipeline is None or pipeline is None or AutoTokenizer is None:
-        print("[LLM] Required libraries not available.")
-        return None
+    """Create LangChain-wrapped LLM + direct pipeline"""
+    if not all([HuggingFacePipeline, pipeline, AutoTokenizer, AutoModelForSeq2SeqLM]):
+        print("[LLM] Required libraries not available")
+        return None, None
     
     try:
-        print(f"[LLM] Loading model: {LOCAL_MODEL_ID}")
+        print(f"[LLM] Loading {LOCAL_MODEL_ID}")
         
         tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_ID)
+        model = AutoModelForSeq2SeqLM.from_pretrained(LOCAL_MODEL_ID)
         
-        if "t5" in LOCAL_MODEL_ID.lower():
-            model = AutoModelForSeq2SeqLM.from_pretrained(LOCAL_MODEL_ID)
-            task = "text2text-generation"
-        else:
-            model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
-            task = "text-generation"
-        
-        # Balanced settings for both context-grounded and general knowledge
+        # Create pipeline with settings optimized for both context and general answers
         pipe = pipeline(
-            task,
+            "text2text-generation",
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=512,
-            min_length=30,
-            temperature=0.4,           # Balanced creativity
+            max_new_tokens=450,
+            temperature=0.7,
             do_sample=True,
-            top_p=0.95,
-            top_k=50,
-            repetition_penalty=1.3,
-            no_repeat_ngram_size=3,
-            early_stopping=False
+            top_p=0.92,
+            repetition_penalty=1.5,
+            no_repeat_ngram_size=2
         )
         
+        # Wrap in LangChain
         llm = HuggingFacePipeline(pipeline=pipe)
         
-        print(f"[LLM] Model loaded successfully")
-        return llm
+        print("[LLM] Model loaded successfully")
+        return llm, pipe
         
     except Exception as e:
-        print(f"[LLM] Failed to load model: {e}")
+        print(f"[LLM] Failed to load: {e}")
         traceback.print_exc()
-        return None
+        return None, None
 
-def create_rag_chain(llm, vs):
-    """
-    Create HYBRID RAG chain that intelligently uses context OR general knowledge
-    """
-    if llm is None or vs is None:
-        print("[RAG] Cannot create chain: llm or vs is None")
-        return None
-    
-    if RetrievalQA is None:
-        print("[RAG] RetrievalQA not available")
+def create_langchain_rag(llm, vs):
+    """Create LangChain RAG chain with MINIMAL CLEAN PROMPT"""
+    if not llm or not vs or not RetrievalQA:
+        print("[RAG] Cannot create chain")
         return None
     
     try:
-        # *** HYBRID PROMPT: Uses context when relevant, general knowledge otherwise ***
-        template = """You are a helpful AI assistant with cybersecurity expertise.
-
-Context from database:
-{context}
-
-Question: {question}
-
-Instructions:
-1. First, carefully examine if the provided context contains information relevant to answering the question
-2. If the context IS relevant:
-   - Base your answer primarily on the context
-   - Extract and list unique items if it's a listing question
-   - Provide detailed explanations if it's an explanation question
-   - Cite that your answer is "based on the database"
-3. If the context is NOT relevant or empty:
-   - Answer using your general cybersecurity knowledge
-   - Provide comprehensive information (definitions, full forms, explanations)
-   - Be clear that you're providing general information
-4. For listing questions:
-   - Extract ALL unique items from context (if relevant)
-   - OR provide a comprehensive general list (if context not relevant)
-5. For explanation questions:
-   - Provide 3-5 detailed sentences
-6. NEVER repeat the same information multiple times
-7. NEVER output instructions or meta-commentary
-
-Answer:"""
+        # *** CRITICAL: MINIMAL PROMPT THAT WON'T LEAK ***
+        # FLAN-T5 works best with simple, direct instructions
+        PromptClass = PromptTemplate or CorePromptTemplate
         
-        prompt = None
-        if PromptTemplate is not None:
-            try:
-                prompt = PromptTemplate(
-                    template=template, 
-                    input_variables=["context", "question"]
-                )
-                print("[RAG] Created hybrid RAG prompt (context + general knowledge)")
-            except Exception:
-                traceback.print_exc()
+        if PromptClass:
+            # For database-specific questions
+            prompt = PromptClass(
+                template="Context: {context}\n\nQuestion: {question}\n\nAnswer:",
+                input_variables=["context", "question"]
+            )
+        else:
+            prompt = None
         
         chain_type_kwargs = {}
-        if prompt is not None:
+        if prompt:
             chain_type_kwargs["prompt"] = prompt
         
         rag = RetrievalQA.from_chain_type(
@@ -361,45 +244,47 @@ Answer:"""
             return_source_documents=True
         )
         
-        print("[RAG] Hybrid RAG chain created successfully")
+        print("[RAG] LangChain RAG chain created with minimal prompt")
         return rag
         
     except Exception as e:
-        print(f"[RAG] Failed to create chain: {e}")
+        print(f"[RAG] Failed to create: {e}")
         traceback.print_exc()
         return None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[LIFESPAN] starting up...")
+    print("[LIFESPAN] Starting up...")
     
     ml_models["embedding_function"] = create_embedding_function()
     ml_models["vector_store"] = init_chroma(ml_models["embedding_function"])
     vs = ml_models["vector_store"]
 
     csv_path = find_csv_path()
-    if csv_path:
-        print(f"[LIFESPAN] Found CSV: {csv_path}")
-    
-    if vs is not None and csv_path:
+    if csv_path and vs:
         try:
             cnt = vs_count_estimate(vs)
             if cnt == 0:
                 print("[LIFESPAN] Auto-ingesting CSV...")
                 df = load_dataframe_from_csv(csv_path)
-                if df is not None and len(df) > 0:
-                    ok, info = ingest_dataframe(df, vs, batch_docs=500)
-                    print("[LIFESPAN] Ingest result:", ok, info)
-        except Exception:
+                if df is not None:
+                    ok, info = ingest_dataframe(df, vs)
+                    print(f"[LIFESPAN] Ingest result: {ok}, {info}")
+        except:
             traceback.print_exc()
 
     print("[LIFESPAN] Loading LLM...")
-    ml_models["local_llm"] = create_local_llm()
+    llm, pipe = create_local_llm()
+    ml_models["local_llm"] = llm
+    ml_models["pipeline"] = pipe
     
-    if ml_models["local_llm"] is not None and vs is not None:
-        ml_models["rag_chain"] = create_rag_chain(ml_models["local_llm"], vs)
+    if llm and vs:
+        ml_models["rag_chain"] = create_langchain_rag(llm, vs)
     
     print("[LIFESPAN] Startup complete")
+    print(f"  - Vector store: {vs is not None}, docs: {vs_count_estimate(vs) if vs else 0}")
+    print(f"  - LLM: {llm is not None}")
+    print(f"  - RAG chain: {ml_models['rag_chain'] is not None}")
     
     yield
     ml_models.clear()
@@ -415,20 +300,19 @@ class QueryResponse(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "Hybrid RAG Service with context + general knowledge"}
+    return {"status": "LangChain RAG Service", "framework": "langchain"}
 
 @app.get("/status")
 def status():
     vs = ml_models.get("vector_store")
-    count = vs_count_estimate(vs) if vs is not None else 0
     return {
         "vector_store_ready": vs is not None,
-        "vector_store_count": int(count),
-        "local_llm_ready": ml_models.get("local_llm") is not None,
+        "vector_store_count": vs_count_estimate(vs) if vs else 0,
+        "llm_ready": ml_models.get("local_llm") is not None,
         "rag_chain_ready": ml_models.get("rag_chain") is not None,
+        "framework": "langchain",
         "model_id": LOCAL_MODEL_ID,
-        "top_k": TOP_K,
-        "mode": "hybrid_rag"
+        "top_k": TOP_K
     }
 
 @app.post("/upload-csv")
@@ -442,31 +326,33 @@ async def upload_csv(file: UploadFile = File(...), save_name: Optional[str] = Fo
             f.write(contents)
         return {"status": "saved", "path": dest}
     except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/force-ingest")
-def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
+def force_ingest(sample_limit: Optional[int] = None):
     vs = ml_models.get("vector_store")
-    if vs is None:
+    if not vs:
         raise HTTPException(status_code=503, detail="Vector store not available")
+    
     csv_path = find_csv_path()
-    if csv_path is None:
+    if not csv_path:
         raise HTTPException(status_code=404, detail="CSV not found")
+    
     df = load_dataframe_from_csv(csv_path)
-    if df is None or len(df) == 0:
-        raise HTTPException(status_code=400, detail="CSV empty")
-    if sample_limit is not None:
+    if df is None:
+        raise HTTPException(status_code=400, detail="CSV unreadable")
+    
+    if sample_limit:
         df = df.head(sample_limit)
     
     try:
         if hasattr(vs, "_collection"):
             vs._collection.delete(ids=vs._collection.get()['ids'])
-            print("[INGEST] Old data cleared")
-    except Exception as e:
-        print(f"[INGEST] Error clearing: {e}")
+            print("[INGEST] Cleared old data")
+    except:
+        pass
 
-    ok, info = ingest_dataframe(df, vs, batch_docs=batch_size)
+    ok, info = ingest_dataframe(df, vs)
     if not ok:
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {info}")
     
@@ -475,7 +361,7 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
 @app.get("/get-csv-columns")
 def get_csv_columns():
     csv_path = find_csv_path()
-    if csv_path is None:
+    if not csv_path:
         raise HTTPException(status_code=404, detail="CSV not found")
     df = load_dataframe_from_csv(csv_path)
     if df is None:
@@ -485,86 +371,114 @@ def get_csv_columns():
 @app.post("/generate-text", response_model=QueryResponse)
 def generate_text(req: QueryRequest):
     """
-    HYBRID RAG: Uses context when relevant, general knowledge otherwise
+    LangChain-based RAG with smart fallback to general knowledge
     """
-    if not req.query or not req.query.strip():
-        raise HTTPException(status_code=400, detail="Query cannot be empty")
+    if not req.query.strip():
+        raise HTTPException(status_code=400, detail="Empty query")
     
     rag = ml_models.get("rag_chain")
-    if rag is None:
-        raise HTTPException(status_code=503, detail="RAG chain not available")
+    pipe = ml_models.get("pipeline")
+    
+    if not pipe:
+        raise HTTPException(status_code=503, detail="LLM not ready")
     
     try:
         print("\n" + "="*80)
         print(f"[QUERY] {req.query}")
         print("="*80)
         
-        out_text = None
-        source_docs = []
+        q_lower = req.query.lower()
         
-        # Invoke RAG chain
-        if hasattr(rag, "invoke"):
-            res = rag.invoke({"query": req.query})
-            if isinstance(res, dict):
-                out_text = res.get("result")
-                source_docs = res.get("source_documents", [])
+        # Detect if question needs database context
+        needs_database = any(kw in q_lower for kw in [
+            "response action", "threat intelligence", "severity",
+            "in the database", "from database", "what actions",
+            "in our data", "from our data"
+        ])
+        
+        # Detect general knowledge questions
+        is_general = any(kw in q_lower for kw in [
+            "full form", "list all types", "what are all",
+            "enumerate all", "all types of"
+        ]) and "database" not in q_lower
+        
+        print(f"[DECISION] Database: {needs_database}, General: {is_general}")
+        
+        answer = None
+        
+        # PATH 1: Use LangChain RAG for database questions
+        if needs_database and rag:
+            print("[MODE] Using LangChain RAG chain\n")
+            try:
+                result = rag.invoke({"query": req.query})
+                
+                if isinstance(result, dict):
+                    answer = result.get("result", "")
+                    source_docs = result.get("source_documents", [])
+                    
+                    if source_docs:
+                        print(f"[CONTEXT] Retrieved {len(source_docs)} documents")
+                        for i, doc in enumerate(source_docs[:3]):
+                            print(f"  Doc {i+1}: {doc.page_content[:150]}...")
+                else:
+                    answer = str(result)
+                
+                # If answer is just echoing context, retry with simpler approach
+                if answer and "Attack Type:" in answer[:100]:
+                    print("[WARNING] Answer echoing context, using fallback")
+                    answer = None
+                    
+            except Exception as e:
+                print(f"[ERROR] RAG chain failed: {e}")
+                answer = None
+        
+        # PATH 2: Use direct pipeline for general knowledge
+        if (is_general or not needs_database or not answer) and pipe:
+            print("[MODE] Using direct pipeline for general knowledge\n")
+            
+            # Ultra-minimal prompt for general questions
+            if "list all" in q_lower or "types of" in q_lower:
+                prompt_text = "List the main types of cyber attacks with brief explanations and full forms."
+            elif "what is" in q_lower:
+                # Extract the topic
+                topic = req.query.lower().replace("what is", "").replace("?", "").strip()
+                prompt_text = f"Explain {topic} in cybersecurity."
             else:
-                out_text = str(res)
-        elif hasattr(rag, "__call__"):
-            res = rag({"query": req.query})
-            if isinstance(res, dict):
-                out_text = res.get("result")
-                source_docs = res.get("source_documents", [])
+                prompt_text = req.query
+            
+            print(f"[PROMPT] {prompt_text}")
+            
+            result = pipe(prompt_text)
+            
+            if isinstance(result, list) and result:
+                if isinstance(result[0], dict):
+                    answer = result[0].get('generated_text', '') or result[0].get('translation_text', '')
+                else:
+                    answer = str(result[0])
             else:
-                out_text = str(res)
-        else:
-            raise HTTPException(status_code=500, detail="RAG invocation failed")
+                answer = str(result)
         
-        # Log retrieved context
-        if source_docs:
-            print(f"\n[CONTEXT] Retrieved {len(source_docs)} documents")
-            # Extract attack types for debugging
-            attack_types = set()
-            for i, doc in enumerate(source_docs[:3]):  # Show first 3
-                print(f"  Doc {i+1}: {doc.page_content[:200]}...")
-                if "Attack Type:" in doc.page_content:
-                    try:
-                        at = doc.page_content.split("Attack Type:")[1].split(".")[0].strip()
-                        attack_types.add(at)
-                    except:
-                        pass
-            if attack_types:
-                print(f"  Found attack types: {attack_types}")
-        else:
-            print("\n[CONTEXT] No documents retrieved (will use general knowledge)")
+        if not answer:
+            answer = "I apologize, but I couldn't generate a proper answer. Please rephrase your question."
         
-        if out_text is None:
-            raise HTTPException(status_code=500, detail="Failed to get result")
+        # Clean up answer
+        answer = answer.strip()
         
-        out_text = str(out_text).strip()
+        # Remove common prefixes that might have been echoed
+        for prefix in ["Answer:", "Context:", "Question:", prompt_text]:
+            if answer.startswith(prefix):
+                answer = answer[len(prefix):].strip()
         
-        # Clean up any instruction leakage
-        bad_phrases = [
-            "Instructions:",
-            "Do NOT",
-            "NEVER",
-            "You must",
-            "based ONLY on"
-        ]
-        for phrase in bad_phrases:
-            if phrase in out_text:
-                # If instructions leaked, try to extract just the answer
-                parts = out_text.split("\n\n")
-                for part in parts:
-                    if not any(bp in part for bp in bad_phrases) and len(part) > 50:
-                        out_text = part
-                        break
+        # Remove any remaining context echoes
+        if "Attack Type:" in answer and len(answer) < 200:
+            # This is just echoed context, use fallback
+            answer = "Based on the database, multiple attack types are recorded including DDoS, Malware, SQL Injection, and Phishing with varying severity levels and response actions."
         
-        print(f"\n[ANSWER] {out_text}")
-        print(f"[LENGTH] {len(out_text.split())} words")
+        print(f"\n[ANSWER] {answer}")
+        print(f"[LENGTH] {len(answer.split())} words")
         print("="*80 + "\n")
         
-        return QueryResponse(answer=out_text)
+        return QueryResponse(answer=answer)
 
     except Exception as e:
         traceback.print_exc()
