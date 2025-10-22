@@ -6,7 +6,7 @@ pydantic==2.7.4
 # Data Processing
 pandas==2.2.0
 
-# LangChain Ecosystem (v0.2.x series - all compatible)
+# LangChain Ecosystem (v0.2.x - fully compatible)
 langchain==0.2.5
 langchain-core==0.2.7
 langchain-community==0.2.5
@@ -15,11 +15,14 @@ langchain-text-splitters==0.2.1
 # Vector Store
 chromadb==0.5.0
 
-# Embeddings & Transformers
-sentence-transformers==3.0.0
-transformers==4.35.0
-tokenizers==0.14.1
-huggingface-hub==0.17.3
+# Embeddings & Transformers - FIXED VERSIONS
+sentence-transformers==3.0.1
+transformers==4.44.0
+huggingface-hub==0.24.5
+tokenizers==0.19.1
+
+# Required for sentence-transformers
+datasets==2.20.0
 
 # Utilities
 python-dotenv==1.0.1

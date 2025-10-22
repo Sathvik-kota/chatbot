@@ -4,8 +4,17 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
-from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
-from langchain_community.llms import HuggingFaceHub
+
+# UPDATED IMPORTS - No more deprecation warnings!
+try:
+    from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint
+    USE_NEW_IMPORTS = True
+except ImportError:
+    # Fallback for older installations
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_community.llms import HuggingFaceHub as HuggingFaceEndpoint
+    USE_NEW_IMPORTS = False
+
 from langchain_community.vectorstores import Chroma
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
@@ -48,31 +57,37 @@ async def lifespan(app: FastAPI):
 
     # 1) initialize embedding function
     try:
-        emb_fn = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+        emb_fn = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
         ml_models["embedding_function"] = emb_fn
-        print("LIFESPAN: embedding function initialized.")
-    except Exception:
+        print(f"LIFESPAN: embedding function initialized (using new imports: {USE_NEW_IMPORTS}).")
+    except Exception as e:
         print("LIFESPAN: failed to initialize embeddings.")
+        print(f"Error: {e}")
         traceback.print_exc()
         ml_models["embedding_function"] = None
 
     # 2) initialize Chroma persistent client
     try:
         os.makedirs(CHROMA_DB_PATH, exist_ok=True)
-        client = Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=ml_models["embedding_function"])
+        client = Chroma(
+            persist_directory=CHROMA_DB_PATH, 
+            embedding_function=ml_models["embedding_function"]
+        )
         ml_models["db_client"] = client
         ml_models["vector_store"] = client
         print("LIFESPAN: Persistent Chroma initialized.")
-    except Exception:
+    except Exception as e:
         print("LIFESPAN: Chroma initialization failed, fallback to in-memory.")
+        print(f"Error: {e}")
         traceback.print_exc()
         try:
             client = Chroma(embedding_function=ml_models["embedding_function"])
             ml_models["db_client"] = client
             ml_models["vector_store"] = client
             print("LIFESPAN: In-memory Chroma initialized.")
-        except Exception:
+        except Exception as e2:
             print("LIFESPAN: Chroma fallback also failed.")
+            print(f"Error: {e2}")
             traceback.print_exc()
             ml_models["vector_store"] = None
 
@@ -80,7 +95,6 @@ async def lifespan(app: FastAPI):
     vs = ml_models.get("vector_store")
     if vs is not None:
         try:
-            # FIX #1: Use .count() instead of ._collection.get()
             collection_count = vs._collection.count()
             
             if collection_count == 0:
@@ -100,9 +114,6 @@ async def lifespan(app: FastAPI):
                         splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
                         chunks = splitter.split_text("\n\n".join(docs))
                         vs.add_texts(texts=chunks)
-                        
-                        # FIX #2: persist() is deprecated in chromadb 0.5+, no longer needed
-                        # Data is auto-persisted with persist_directory
                         print(f"LIFESPAN: ingested {len(docs)} docs -> {len(chunks)} chunks.")
                     else:
                         print(f"LIFESPAN: CSV missing required columns (need {required_cols}); skipping ingestion.")
@@ -110,8 +121,9 @@ async def lifespan(app: FastAPI):
                     print("LIFESPAN: CSV not loaded; skipping ingestion.")
             else:
                 print(f"LIFESPAN: vector store already has {collection_count} items; skipping ingestion.")
-        except Exception:
+        except Exception as e:
             print("LIFESPAN: vector store ingestion/check failed.")
+            print(f"Error: {e}")
             traceback.print_exc()
 
     # 4) initialize RAG chain
@@ -122,19 +134,22 @@ async def lifespan(app: FastAPI):
         if vs is None:
             print("LIFESPAN: vector store unavailable; cannot init RAG chain.")
         else:
-            def try_create_llm(repo_id, task_type):
+            def try_create_llm(repo_id):
                 try:
-                    print(f"LIFESPAN: creating LLM for {repo_id} with task {task_type}")
-                    llm = HuggingFaceHub(
+                    print(f"LIFESPAN: creating LLM for {repo_id}")
+                    
+                    # Use new HuggingFaceEndpoint
+                    llm = HuggingFaceEndpoint(
                         repo_id=repo_id,
-                        task=task_type,
                         huggingfacehub_api_token=HF_TOKEN,
-                        model_kwargs={"temperature": 0.5, "max_new_tokens": 1024}
+                        temperature=0.5,
+                        max_new_tokens=1024
                     )
+                    
                     rag = RetrievalQA.from_chain_type(
                         llm=llm,
                         chain_type="stuff",
-                        retriever=vs.as_retriever()
+                        retriever=vs.as_retriever(search_kwargs={"k": 3})
                     )
                     print(f"LIFESPAN: LLM {repo_id} initialized successfully.")
                     return rag
@@ -143,10 +158,10 @@ async def lifespan(app: FastAPI):
                     traceback.print_exc()
                     return None
 
-            rag = try_create_llm(PRIMARY_REPO_ID, task_type="text-generation")
+            rag = try_create_llm(PRIMARY_REPO_ID)
             if rag is None:
                 print("LIFESPAN: Primary model failed, trying fallback...")
-                rag = try_create_llm(FALLBACK_SMALL_REPO_ID, task_type="text2text-generation")
+                rag = try_create_llm(FALLBACK_SMALL_REPO_ID)
             
             ml_models["rag_chain"] = rag
 
@@ -190,11 +205,9 @@ async def generate_text(req: QueryRequest):
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
     
     try:
-        # FIX #3: Use invoke() instead of deprecated run()
         print(f"Invoking RAG chain with query: {req.query}")
         result = rag_chain.invoke({"query": req.query})
         
-        # Extract answer from result dict
         answer = result.get("result", "No answer generated.")
         print(f"RAG chain generated answer: {answer}")
         
