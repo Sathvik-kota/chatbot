@@ -1,8 +1,6 @@
 """
-Robust RAG service with LOCAL MODEL support - WORKING VERSION
-
-This version runs models LOCALLY using HuggingFace Pipelines instead of
-relying on the serverless Inference API which no longer supports generative models.
+Robust RAG service with LOCAL MODEL support - IMPROVED VERSION
+Now generates DETAILED, COMPLETE answers instead of single-word responses
 """
 import os
 import traceback
@@ -65,8 +63,8 @@ DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # Use a SMALL local model that works well for Q&A
-LOCAL_MODEL_ID = "google/flan-t5-small"  # Small enough to run in Colab
-# Alternatives: "google/flan-t5-base", "t5-small"
+LOCAL_MODEL_ID = "google/flan-t5-base"  # Using base instead of small for better quality
+# If base is too slow, use: "google/flan-t5-small"
 
 TOP_K = 4
 
@@ -219,7 +217,7 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
     return True, {"method": method, "docs_added": total_added}
 
 def create_local_llm():
-    """Create a local HuggingFace Pipeline model"""
+    """Create a local HuggingFace Pipeline model with improved generation settings"""
     if HuggingFacePipeline is None:
         print("[LLM] HuggingFacePipeline not available.")
         return None
@@ -242,18 +240,31 @@ def create_local_llm():
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text-generation"
         
-        # Create pipeline
+        # Create pipeline with BETTER generation parameters
         pipe = pipeline(
             task,
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=256,
-            temperature=0.3,
-            do_sample=True
+            max_new_tokens=512,  # INCREASED from 256 to allow longer answers
+            min_length=50,  # FORCE minimum length
+            temperature=0.7,  # INCREASED for more diverse outputs
+            do_sample=True,
+            top_p=0.95,  # Nucleus sampling
+            repetition_penalty=1.2,  # Prevent repetition
+            no_repeat_ngram_size=3  # Avoid repeating 3-grams
         )
         
-        # Wrap in LangChain
-        llm = HuggingFacePipeline(pipeline=pipe)
+        # Wrap in LangChain with pipeline_kwargs
+        llm = HuggingFacePipeline(
+            pipeline=pipe,
+            model_kwargs={
+                "max_new_tokens": 512,
+                "min_length": 50,
+                "temperature": 0.7,
+                "do_sample": True
+            }
+        )
+        
         print(f"[LLM] Local model loaded successfully: {LOCAL_MODEL_ID}")
         return llm
         
@@ -263,7 +274,7 @@ def create_local_llm():
         return None
 
 def create_rag_chain(llm, vs):
-    """Create RAG chain with local LLM"""
+    """Create RAG chain with IMPROVED prompt template"""
     if llm is None or vs is None:
         print("[RAG] Cannot create chain: llm or vs is None")
         return None
@@ -273,20 +284,27 @@ def create_rag_chain(llm, vs):
         return None
     
     try:
-        # Create custom prompt template optimized for T5
-        template = """Answer the following question based on the context provided.
+        # IMPROVED prompt template that encourages detailed answers
+        template = """You are a cybersecurity expert. Use the following context to provide a detailed and comprehensive answer to the question.
 
-Context: {context}
+Context:
+{context}
 
 Question: {question}
 
-Answer:"""
+Provide a detailed answer that:
+1. Explains what it is
+2. Describes how it works
+3. Mentions its purpose or impact
+4. Provides relevant technical details
+
+Detailed Answer:"""
         
         prompt = None
         if PromptTemplate is not None:
             try:
                 prompt = PromptTemplate(template=template, input_variables=["context", "question"])
-                print("[RAG] Created custom prompt template")
+                print("[RAG] Created improved prompt template")
             except Exception:
                 traceback.print_exc()
         
@@ -295,11 +313,13 @@ Answer:"""
         if prompt is not None:
             chain_type_kwargs["prompt"] = prompt
         
+        # Add return_source_documents for debugging
         rag = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
             retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),
-            chain_type_kwargs=chain_type_kwargs
+            chain_type_kwargs=chain_type_kwargs,
+            return_source_documents=False  # Set to True if you want to see retrieved docs
         )
         
         print("[RAG] RAG chain created successfully")
@@ -436,14 +456,14 @@ def generate_text(req: QueryRequest):
         # Try different invocation methods
         if hasattr(rag, "run"):
             out = rag.run(req.query)
-            return QueryResponse(answer=str(out))
+            return QueryResponse(answer=str(out).strip())
         elif hasattr(rag, "invoke"):
             res = rag.invoke({"query": req.query})
             answer = res.get("result") if isinstance(res, dict) else res
-            return QueryResponse(answer=str(answer))
+            return QueryResponse(answer=str(answer).strip())
         elif callable(rag):
             out = rag(req.query)
-            return QueryResponse(answer=str(out))
+            return QueryResponse(answer=str(out).strip())
         else:
             raise HTTPException(status_code=500, detail="RAG chain invocation method not found")
     except Exception as e:
