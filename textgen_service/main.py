@@ -10,6 +10,7 @@ Key Updates:
 - TOP_K set to 4 as requested.
 - ingest_dataframe now formats CSV rows into natural language sentences.
 - /generate-text endpoint now contains all-new conditional logic.
+- FIXED: Generation parameters for better, more detailed answers
 """
 import os
 import traceback
@@ -97,12 +98,8 @@ ml_models = {
 }
 
 # ---------------- Chat prompt setup ----------------
-# --- NEW, SIMPLER PROMPT ---
-# The complex logic is now in the Python code, not the prompt.
-# This prompt just tells the model what info it has.
-text_template = """You are a helpful cybersecurity expert assistant.
-Answer the user's 'Question' using your general knowledge and the provided 'Chat History'.
-If 'Context from database' is provided and relevant, use it to answer data-specific questions.
+# --- UPDATED PROMPT FOR BETTER ANSWERS ---
+text_template = """You are a helpful cybersecurity expert assistant. Provide detailed, informative answers.
 
 Chat History:
 {chat_history}
@@ -111,6 +108,8 @@ Context from database:
 {context}
 
 Question: {question}
+
+Please provide a comprehensive answer. If the context is relevant, use it. Otherwise, use your general knowledge to give a thorough explanation.
 
 Answer:"""
 
@@ -347,21 +346,19 @@ def create_local_llm():
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text-generation"
 
+        # --- UPDATED GENERATION PARAMETERS FOR BETTER ANSWERS ---
         pipe = pipeline(
             task,
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=512,
-            
-            # --- MODIFIED: Removed 'min_new_tokens' ---
-            # This parameter was forcing the model to copy the database context
-            # instead of actually answering the question.
+            max_new_tokens=256,  # Reduced from 512 for more focused answers
             do_sample=True,
-            temperature=0.7, # Raise temperature slightly to encourage fuller answers
-            # min_new_tokens=30, # <-- REMOVED
-            
-            repetition_penalty=1.2,
-            early_stopping=True
+            temperature=0.3,  # Lower temperature for more deterministic, complete answers
+            top_p=0.9,        # Add top-p sampling for better quality
+            repetition_penalty=1.1,  # Reduced repetition penalty
+            early_stopping=True,
+            num_beams=4,      # Use beam search for better quality
+            length_penalty=0.8  # Encourage slightly longer responses
         )
 
         # Keep a direct hf pipeline as fallback too
@@ -721,9 +718,3 @@ async def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn main:app --host 0.0.0.0 --port 8002")
-
-
-
-
-
-
