@@ -1,6 +1,6 @@
 """
-Robust RAG service with LOCAL MODEL support - FINAL FIXED VERSION
-Handles both detailed explanations AND listing/aggregation queries correctly
+Robust RAG service with LOCAL MODEL support - CHAT PROMPT VERSION
+Adds ChatPromptTemplate (with safe fallbacks) to the RAG prompt logic.
 """
 import os
 import traceback
@@ -11,6 +11,23 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
 # --- Try imports (be tolerant across environments) ---
+# ChatPromptTemplate: try a couple of possible import paths
+try:
+    from langchain.prompts import ChatPromptTemplate
+except Exception:
+    try:
+        from langchain.prompts.chat import ChatPromptTemplate
+    except Exception:
+        ChatPromptTemplate = None
+
+try:
+    from langchain.prompts import PromptTemplate
+except Exception:
+    try:
+        from langchain_core.prompts import PromptTemplate
+    except Exception:
+        PromptTemplate = None
+
 try:
     from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
 except Exception:
@@ -28,14 +45,6 @@ except Exception:
         from langchain_community.llms import HuggingFacePipeline
     except Exception:
         HuggingFacePipeline = None
-
-try:
-    from langchain.prompts import PromptTemplate
-except Exception:
-    try:
-        from langchain_core.prompts import PromptTemplate
-    except Exception:
-        PromptTemplate = None
 
 try:
     from langchain.chains import RetrievalQA
@@ -242,6 +251,7 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
     
     # Add documents in batches
     total_added = 0
+    method = None
     for i in range(0, len(docs), batch_docs):
         batch = docs[i:i+batch_docs]
         ok, method = _try_add_texts(vs, batch)
@@ -319,7 +329,7 @@ def create_rag_chain(llm, vs):
     
     try:
         # *** CRITICAL: PROMPT THAT HANDLES BOTH LISTING AND EXPLANATION QUERIES ***
-        template = """You are a cybersecurity expert assistant. Answer the question based ONLY on the provided context from the database.
+        text_template = """You are a cybersecurity expert assistant. Answer the question based ONLY on the provided context from the database.
 
 Context from database:
 {context}
@@ -337,23 +347,37 @@ Instructions:
 8. Do NOT use general knowledge - use ONLY what's in the context above
 
 Answer:"""
-        
-        prompt = None
-        if PromptTemplate is not None:
+
+        prompt_obj = None
+
+        # Prefer a chat-style prompt if available.
+        if ChatPromptTemplate is not None:
             try:
-                prompt = PromptTemplate(
-                    template=template, 
-                    input_variables=["context", "question"]
-                )
-                print("[RAG] Created optimized prompt for both listing and explanation")
+                # Attempt the simple from_messages style (works in many langchain versions)
+                chat_prompt = ChatPromptTemplate.from_messages([
+                    ("system", "You are a cybersecurity expert. Use the provided context to answer accurately and clearly. If info is missing, say you cannot find it in the context."),
+                    ("human", "Context: {context}\n\nQuestion: {question}")
+                ])
+                prompt_obj = chat_prompt
+                print("[RAG] Using ChatPromptTemplate for RAG.")
+            except Exception:
+                # If from_messages signature isn't supported, fall back to text template below
+                traceback.print_exc()
+                prompt_obj = None
+
+        # Fallback to old PromptTemplate if chat-style not available or failed
+        if prompt_obj is None and PromptTemplate is not None:
+            try:
+                prompt_obj = PromptTemplate(template=text_template, input_variables=["context", "question"])
+                print("[RAG] Using fallback PromptTemplate for RAG.")
             except Exception:
                 traceback.print_exc()
-        
-        # Create RAG chain
+                prompt_obj = None
+
         chain_type_kwargs = {}
-        if prompt is not None:
-            chain_type_kwargs["prompt"] = prompt
-        
+        if prompt_obj is not None:
+            chain_type_kwargs["prompt"] = prompt_obj
+
         rag = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
@@ -542,12 +566,10 @@ def generate_text(req: QueryRequest):
         # Log retrieved context
         if source_docs:
             print(f"\n[CONTEXT] Retrieved {len(source_docs)} document(s):")
-            # Extract unique attack types from context for debugging
             attack_types_in_context = set()
             for i, doc in enumerate(source_docs):
                 print(f"\n  --- Document {i+1} ---")
                 print(f"  {doc.page_content[:300]}...")
-                # Extract attack type if present
                 if "Attack Type:" in doc.page_content:
                     try:
                         attack_type = doc.page_content.split("Attack Type:")[1].split(".")[0].strip()
