@@ -6,9 +6,11 @@ NOW WITH CONVERSATIONAL MEMORY.
 Key Updates:
 - TOP_K set to 4 as requested.
 - ingest_dataframe now formats CSV rows into natural language sentences.
-- text_template is now *highly explicit* to force the model to
-  distinguish between general questions (use LLM knowledge) and
-  data questions (use RAG context).
+- /generate-text endpoint now contains all-new conditional logic:
+  - It detects if a question is "general" (e.g., "what is...").
+  - If it's a general question, it FORCES context to be empty.
+  - If it's a data question, it retrieves and includes context.
+- This bypasses the simple RetrievalQA chain to fix the "context copying" bug.
 """
 import os
 import traceback
@@ -87,26 +89,19 @@ ml_models = {
     "embedding_function": None,
     "vector_store": None,
     "local_llm": None,  # LangChain HuggingFacePipeline wrapper (if used)
-    "rag_chain": None,
+    "rag_chain": None, # We will bypass this, but keep it as a potential fallback
     "memory": None, # Global memory object
     # optional direct pipeline store (not required)
     "hf_pipeline": None
 }
 
 # ---------------- Chat prompt setup ----------------
-# --- NEW, V_EXPLICIT PROMPT ---
-# This prompt is designed to force the T5 model to differentiate
-# between general knowledge questions and RAG/data questions.
+# --- NEW, SIMPLER PROMPT ---
+# The complex logic is now in the Python code, not the prompt.
+# This prompt just tells the model what info it has.
 text_template = """You are a helpful cybersecurity expert assistant.
-Your job is to answer the user's 'Question'.
-
-You have two sources of information:
-1. Your own general knowledge.
-2. 'Context from database', which contains raw data logs (e.g., 'Attack Type: DDoS, Severity: High...').
-
-**Instructions:**
-- **For general questions** (like "What is a DDoS attack?", "Define vulnerability", "How does a SYN flood work?"), **IGNORE the 'Context from database'** and answer using your own general knowledge.
-- **For data-specific questions** (like "What attacks happened?", "List threat intelligence", "What was the response for the DDoS attack?"), use the 'Context from database' to find and present the answer.
+Answer the user's 'Question' using your general knowledge and the provided 'Chat History'.
+If 'Context from database' is provided and relevant, use it to answer data-specific questions.
 
 Chat History:
 {chat_history}
@@ -383,6 +378,7 @@ def create_local_llm():
         return None
 
 def create_rag_chain(llm, vs, memory_obj=None):
+    # This chain will only be used as a fallback if our new logic fails
     if llm is None or vs is None:
         print("[RAG] Cannot create chain: llm or vs is None")
         return None
@@ -513,6 +509,7 @@ async def lifespan(app: FastAPI):
     else:
         print("[LIFESPAN] ConversationBufferMemory not available, chain will be stateless.")
 
+    # We still create the RAG chain as a *backup*
     if ml_models["local_llm"] is not None and vs is not None:
         ml_models["rag_chain"] = create_rag_chain(
             ml_models["local_llm"], 
@@ -638,81 +635,84 @@ def reset_memory():
 @app.post("/generate-text", response_model=QueryResponse)
 async def generate_text(req: QueryRequest):
     """
-    Generate answers using RAG - ensures retrieved context + text prompt are passed to the LLM
+    --- NEW LOGIC ---
+    This function now implements conditional logic to prevent
+    context-copying for general questions.
     """
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
-    # Prefer using the RAG chain if available (it already has the prompt and memory)
-    rag = ml_models.get("rag_chain")
-    if rag is not None:
-        try:
-            # Support both .invoke and callable interfaces
-            if hasattr(rag, "invoke"):
-                res = rag.invoke({"query": req.query})
-            else:
-                res = rag({"query": req.query})
-            if isinstance(res, dict):
-                out_text = res.get("result") or res.get("output_text") or str(res)
-            else:
-                out_text = str(res)
-            out_text = out_text.strip()
-            return QueryResponse(answer=out_text)
-        except Exception:
-            traceback.print_exc()
-            # fall through to manual retrieval+LLM flow
-
-    # Manual flow: retrieve context and format PromptTemplate
     vs = ml_models.get("vector_store")
     local_llm = ml_models.get("local_llm") or ml_models.get("hf_pipeline")
     memory = ml_models.get("memory")
+
+    if local_llm is None:
+        raise HTTPException(status_code=503, detail="No local LLM available.")
+
+    query_str_lower = req.query.strip().lower()
     context_text = ""
-    if vs is not None:
-        try:
-            # --- USER REQUEST: Use TOP_K (which is 4) ---
-            retriever = vs.as_retriever(search_kwargs={"k": TOP_K})
-            
-            if hasattr(retriever, "get_relevant_documents"):
-                docs = retriever.get_relevant_documents(req.query)
-            elif hasattr(retriever, "retrieve"):
-                docs = retriever.retrieve(req.query)
-            else:
-                docs = retriever(req.query) if callable(retriever) else []
-            
-            if docs:
-                context_text = "\n\n".join([getattr(d, "page_content", str(d)) for d in docs])
-        except Exception:
-            traceback.print_exc()
+    retrieved_docs = []
+
+    # --- NEW CONDITIONAL LOGIC ---
     
-    # --- Manual Memory Handling (for fallback) ---
+    # 1. Define general question triggers
+    general_question_triggers = [
+        "what is a ", "what is ", "what's a ", "what's ",
+        "what are ", "what are ", "define ", "explain ", "how does"
+    ]
+    is_general_question = any(query_str_lower.startswith(trigger) for trigger in general_question_triggers)
+
+    # 2. If it's NOT a general question, retrieve context.
+    if not is_general_question:
+        if vs is not None:
+            try:
+                print(f"[LOGIC] Data question detected. Retrieving TOP_K={TOP_K} docs...")
+                retriever = vs.as_retriever(search_kwargs={"k": TOP_K})
+                
+                if hasattr(retriever, "get_relevant_documents"):
+                    retrieved_docs = retriever.get_relevant_documents(req.query)
+                elif hasattr(retriever, "retrieve"):
+                    retrieved_docs = retriever.retrieve(req.query)
+                else:
+                    retrieved_docs = retriever(req.query) if callable(retriever) else []
+                
+                if retrieved_docs:
+                    context_text = "\n\n".join([getattr(d, "page_content", str(d)) for d in retrieved_docs])
+                    print(f"[LOGIC] Found {len(retrieved_docs)} relevant docs.")
+                else:
+                    context_text = "(No relevant data context found)"
+            except Exception as e:
+                traceback.print_exc()
+                context_text = "(Error during context retrieval)"
+        else:
+            context_text = "(Vector store not available)"
+    else:
+        print("[LOGIC] General question detected. Forcing empty context.")
+        context_text = "(No context needed for general question)"
+
+    # 3. Load chat history
     chat_history = ""
     if memory is not None:
         try:
-            # Load history
             chat_history = memory.load_memory_variables({}).get("chat_history", "")
         except Exception as e:
             print(f"[MEMORY] Error loading memory: {e}")
 
-    # Format prompt: We only use the single-string text_template
+    # 4. Build the final prompt
     formatted_prompt = build_fallback_prompt(chat_history, context_text, req.query)
 
-    # Send prompt to LLM (local wrapper or direct pipeline)
-    if local_llm is None:
-        raise HTTPException(status_code=503, detail="No local LLM available to generate answer.")
-
+    # 5. Send to LLM
     generated = send_to_llm(local_llm, formatted_prompt)
     if not generated:
         raise HTTPException(status_code=500, detail="LLM produced no output.")
 
-    # --- Manual Memory Handling (for fallback) ---
+    # 6. Save to memory
     if memory is not None:
         try:
-            # Save context
             memory.save_context({"question": req.query}, {"answer": generated})
-            print("[MEMORY] Manual flow saved to memory.")
+            print("[MEMORY] Context saved to memory.")
         except Exception as e:
             print(f"[MEMORY] Error saving memory: {e}")
-
 
     generated = generated.strip()
     return QueryResponse(answer=generated)
