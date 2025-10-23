@@ -1,6 +1,6 @@
 """
-Robust RAG service with LOCAL MODEL support
-FIXED: Proper context prioritization for conversational questions
+FINAL WORKING RAG SERVICE with PROPER CONVERSATIONAL MEMORY
+Based on proven LangChain ConversationalRetrievalChain patterns
 """
 
 import os
@@ -11,22 +11,13 @@ from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Request
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
-# Try imports (be tolerant across environments)
+# Try imports
 try:
     from langchain.prompts import PromptTemplate
+    from langchain_core.prompts import ChatPromptTemplate
 except Exception:
-    try:
-        from langchain_core.prompts import PromptTemplate
-    except Exception:
-        PromptTemplate = None
-
-try:
-    from langchain.memory import ConversationBufferMemory
-except Exception:
-    try:
-        from langchain_community.memory import ConversationBufferMemory
-    except Exception:
-        ConversationBufferMemory = None
+    PromptTemplate = None
+    ChatPromptTemplate = None
 
 try:
     from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
@@ -47,12 +38,12 @@ except Exception:
         HuggingFacePipeline = None
 
 try:
-    from langchain.chains import RetrievalQA
+    from langchain.chains import ConversationalRetrievalChain
 except Exception:
     try:
-        from langchain_community.chains import RetrievalQA
+        from langchain_community.chains import ConversationalRetrievalChain
     except Exception:
-        RetrievalQA = None
+        ConversationalRetrievalChain = None
 
 try:
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, pipeline
@@ -71,7 +62,7 @@ DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 LOCAL_MODEL_ID = "google/flan-t5-large"
-TOP_K = 4
+TOP_K = 5
 
 # ---------------- Globals ----------------
 ml_models = {
@@ -79,24 +70,8 @@ ml_models = {
     "vector_store": None,
     "local_llm": None,
     "rag_chain": None,
-    "memory": None,
-    "hf_pipeline": None
+    "chat_history": []  # Store as list of tuples (question, answer)
 }
-
-# ---------------- IMPROVED PROMPT ----------------
-text_template = """You are a cybersecurity expert assistant having a conversation with a user.
-
-Previous Conversation:
-{chat_history}
-
-Context from database:
-{context}
-
-Current Question: {question}
-
-Provide a helpful, detailed answer. If the question references previous conversation, prioritize using the chat history over the database context.
-
-Answer:"""
 
 # ---------------- Helpers ----------------
 def find_csv_path(basename: str = DEFAULT_CSV_BASENAME) -> Optional[str]:
@@ -216,13 +191,6 @@ def _try_add_texts(vs, texts: List[str]):
             return True, "_collection.add"
     except Exception:
         traceback.print_exc()
-    try:
-        for t in texts:
-            if hasattr(vs, "add_texts"):
-                vs.add_texts(texts=[t])
-        return True, "iterative_add_texts"
-    except Exception:
-        traceback.print_exc()
     return False, None
 
 def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
@@ -237,10 +205,10 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
         "Response Action",
         "User Agent"
     ]
-    
+
     df_cols_lower = {col.lower(): col for col in df.columns}
     cols_to_use = [df_cols_lower[c.lower()] for c in USEFUL_COLUMNS if c.lower() in df_cols_lower]
-    
+
     if not cols_to_use:
         print("[INGEST] ERROR: Could not find expected text columns.")
         print(f"[INGEST] Available columns: {list(df.columns)}")
@@ -249,23 +217,29 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
     print(f"[INGEST] Using text columns for embedding: {cols_to_use}")
 
     def create_doc(row):
-        parts = ["A cybersecurity event was recorded"]
+        parts = []
         
-        if "Attack Type" in cols_to_use and pd.notna(row["Attack Type"]):
-            parts.append(f"Attack Type: {row['Attack Type']}")
-        if "Attack Severity" in cols_to_use and pd.notna(row["Attack Severity"]):
-            parts.append(f"Severity: {row['Attack Severity']}")
-        if "Threat Intelligence" in cols_to_use and pd.notna(row["Threat Intelligence"]):
-            parts.append(f"Threat Intelligence: {row['Threat Intelligence']}")
-        if "Response Action" in cols_to_use and pd.notna(row["Response Action"]):
-            parts.append(f"Response: {row['Response Action']}")
-        if "Data Exfiltrated" in cols_to_use and pd.notna(row["Data Exfiltrated"]):
-            parts.append(f"Data Exfiltrated: {row['Data Exfiltrated']}")
-        if "User Agent" in cols_to_use and pd.notna(row["User Agent"]):
-             parts.append(f"User Agent: {row['User Agent']}")
+        if "Attack Type" in cols_to_use and pd.notna(row.get("Attack Type")):
+            attack_type = row['Attack Type']
+            parts.append(f"This cybersecurity event involves a {attack_type} attack.")
+        
+        if "Attack Severity" in cols_to_use and pd.notna(row.get("Attack Severity")):
+            parts.append(f"The severity level is {row['Attack Severity']}.")
+        
+        if "Threat Intelligence" in cols_to_use and pd.notna(row.get("Threat Intelligence")):
+            parts.append(f"Threat intelligence: {row['Threat Intelligence']}")
+        
+        if "Response Action" in cols_to_use and pd.notna(row.get("Response Action")):
+            parts.append(f"The response action taken was: {row['Response Action']}.")
+        
+        if "Data Exfiltrated" in cols_to_use and pd.notna(row.get("Data Exfiltrated")):
+            parts.append(f"Data exfiltration occurred: {row['Data Exfiltrated']}.")
+        
+        if "User Agent" in cols_to_use and pd.notna(row.get("User Agent")):
+            parts.append(f"User agent: {row['User Agent']}")
 
-        if len(parts) > 1:
-            return parts[0] + ": " + ", ".join(parts[1:]) + "."
+        if parts:
+            return " ".join(parts)
         else:
             return ""
 
@@ -299,12 +273,13 @@ def create_local_llm():
     if HuggingFacePipeline is None:
         print("[LLM] HuggingFacePipeline not available.")
         return None
-    if pipeline is None or AutoTokenizer is None or AutoModelForSeq2SeqLM is None:
+    if pipeline is None or AutoTokenizer is None:
         print("[LLM] transformers not available.")
         return None
     try:
         print(f"[LLM] Loading local model: {LOCAL_MODEL_ID}")
         tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_ID)
+        
         if "t5" in LOCAL_MODEL_ID.lower():
             model = AutoModelForSeq2SeqLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text2text-generation"
@@ -316,26 +291,21 @@ def create_local_llm():
             task,
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=300,
-            min_new_tokens=30,
+            max_length=512,
+            max_new_tokens=150,
             do_sample=True,
-            temperature=0.7,
+            temperature=0.8,
             top_p=0.9,
-            repetition_penalty=1.1,
-            early_stopping=False,
-            num_beams=3,
-            length_penalty=1.0,
-            no_repeat_ngram_size=2
+            repetition_penalty=1.3,
+            num_beams=2
         )
-
-        ml_models["hf_pipeline"] = pipe
 
         try:
             llm = HuggingFacePipeline(pipeline=pipe)
-            print(f"[LLM] Local model wrapped in HuggingFacePipeline: {LOCAL_MODEL_ID}")
+            print(f"[LLM] Local model wrapped: {LOCAL_MODEL_ID}")
             return llm
         except Exception:
-            print("[LLM] Could not wrap pipeline in HuggingFacePipeline; returning raw pipeline as fallback.")
+            print("[LLM] Returning raw pipeline.")
             return pipe
 
     except Exception as e:
@@ -343,78 +313,41 @@ def create_local_llm():
         traceback.print_exc()
         return None
 
-def create_rag_chain(llm, vs, memory_obj=None):
-    if llm is None or vs is None:
-        print("[RAG] Cannot create chain: llm or vs is None")
+def create_conversational_chain(llm, vs):
+    """Create ConversationalRetrievalChain - the PROPER way to handle conversational RAG"""
+    if llm is None or vs is None or ConversationalRetrievalChain is None:
+        print("[CHAIN] Cannot create conversational chain")
         return None
-    if RetrievalQA is None:
-        print("[RAG] RetrievalQA not available")
-        return None
+    
     try:
-        prompt_obj = None
+        # QA Prompt - for answering based on context
+        qa_template = """You are a helpful cybersecurity assistant. Use the following context to answer the question. 
+If you don't know the answer based on the context, say "I don't have enough information to answer that."
+
+Context: {context}
+
+Question: {question}
+
+Helpful Answer:"""
         
-        if prompt_obj is None and PromptTemplate is not None:
-            try:
-                prompt_obj = PromptTemplate(template=text_template, input_variables=["chat_history", "context", "question"])
-                print("[RAG] Using PromptTemplate for chain with memory.")
-            except Exception:
-                traceback.print_exc()
-                prompt_obj = None
-
-        chain_type_kwargs = {}
-        if prompt_obj is not None:
-            chain_type_kwargs["prompt"] = prompt_obj
-
-        rag = RetrievalQA.from_chain_type(
+        QA_PROMPT = PromptTemplate(template=qa_template, input_variables=["context", "question"])
+        
+        # Create the chain
+        chain = ConversationalRetrievalChain.from_llm(
             llm=llm,
-            chain_type="stuff",
             retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),
-            chain_type_kwargs=chain_type_kwargs,
             return_source_documents=True,
-            memory=memory_obj
+            combine_docs_chain_kwargs={"prompt": QA_PROMPT},
+            verbose=True
         )
-        print(f"[RAG] RAG chain created successfully with prompt, memory, and TOP_K={TOP_K}")
-        return rag
+        
+        print("[CHAIN] ConversationalRetrievalChain created successfully")
+        return chain
+        
     except Exception as e:
-        print(f"[RAG] Failed to create chain: {e}")
+        print(f"[CHAIN] Error creating chain: {e}")
         traceback.print_exc()
         return None
-
-def build_fallback_prompt(chat_history: str, context: str, question: str) -> str:
-    if PromptTemplate is not None:
-         try:
-            prompt_obj = PromptTemplate(template=text_template, input_variables=["chat_history", "context", "question"])
-            return prompt_obj.format(chat_history=chat_history, context=context, question=question)
-         except Exception:
-            pass
-    try:
-        return text_template.format(chat_history=chat_history, context=context, question=question)
-    except Exception:
-        return f"Previous Conversation: {chat_history}\n\nContext: {context}\n\nCurrent Question: {question}\n\nAnswer:"
-
-def send_to_llm(llm_obj, prompt_text: str) -> str:
-    try:
-        if hasattr(llm_obj, "invoke"):
-            out = llm_obj.invoke(prompt_text)
-            if isinstance(out, dict):
-                return out.get("result") or out.get("generated_text") or str(out)
-            return str(out)
-        if hasattr(llm_obj, "__call__"):
-            out = llm_obj(prompt_text)
-            if isinstance(out, dict):
-                return out.get("result") or out.get("generated_text") or str(out)
-            return str(out)
-        if callable(llm_obj):
-            out = llm_obj(prompt_text)
-            if isinstance(out, list) and out:
-                first = out[0]
-                if isinstance(first, dict):
-                    return first.get("generated_text") or first.get("translation_text") or first.get("summary_text") or str(first)
-                return str(first)
-            return str(out)
-    except Exception:
-        traceback.print_exc()
-    return ""
 
 # ---------------- Lifespan & app ----------------
 @asynccontextmanager
@@ -423,58 +356,38 @@ async def lifespan(app: FastAPI):
     ml_models["embedding_function"] = create_embedding_function()
     ml_models["vector_store"] = init_chroma(ml_models["embedding_function"])
     vs = ml_models["vector_store"]
-    print(f"[LIFESPAN] vector_store object: {type(vs).__name__ if vs is not None else None}")
 
     csv_path = find_csv_path()
     if csv_path:
         print(f"[LIFESPAN] Found CSV at: {csv_path}")
     else:
-        print("[LIFESPAN] No sampled CSV found automatically.")
+        print("[LIFESPAN] No CSV found.")
 
     if vs is not None and csv_path:
         try:
             cnt = vs_count_estimate(vs)
-            print(f"[LIFESPAN] vector store estimated count: {cnt}")
+            print(f"[LIFESPAN] vector store count: {cnt}")
             if cnt == 0:
-                print("[LIFESPAN] Auto-ingesting CSV (may take time)...")
+                print("[LIFESPAN] Auto-ingesting CSV...")
                 df = load_dataframe_from_csv(csv_path)
                 if df is not None and len(df) > 0:
                     ok, info = ingest_dataframe(df, vs, batch_docs=500)
-                    print("[LIFESPAN] ingest result:", ok, info)
+                    print(f"[LIFESPAN] ingest result: {ok}, {info}")
         except Exception:
             traceback.print_exc()
-    else:
-        print("[LIFESPAN] Skipping auto-ingest (no vs or no csv)")
 
-    print("[LIFESPAN] Loading local LLM (this may take a minute)...")
+    print("[LIFESPAN] Loading local LLM...")
     ml_models["local_llm"] = create_local_llm()
 
-    # Create global memory object with proper configuration
-    if ConversationBufferMemory is not None:
-        ml_models["memory"] = ConversationBufferMemory(
-            memory_key="chat_history", 
-            return_messages=False,
-            input_key="question",
-            output_key="answer"
-        )
-        print("[LIFESPAN] Global ConversationBufferMemory created.")
-    else:
-        print("[LIFESPAN] ConversationBufferMemory not available, chain will be stateless.")
+    if ml_models["local_llm"] and vs:
+        ml_models["rag_chain"] = create_conversational_chain(ml_models["local_llm"], vs)
 
-    if ml_models["local_llm"] is not None and vs is not None:
-        ml_models["rag_chain"] = create_rag_chain(
-            ml_models["local_llm"], 
-            vs, 
-            ml_models["memory"]
-        )
+    ml_models["chat_history"] = []
 
     print("[LIFESPAN] startup complete:", {
         "vector_store_ready": vs is not None,
-        "vector_store_count": vs_count_estimate(vs) if vs is not None else 0,
         "local_llm_ready": ml_models.get("local_llm") is not None,
         "rag_chain_ready": ml_models.get("rag_chain") is not None,
-        "memory_ready": ml_models.get("memory") is not None,
-        "csv_found": bool(csv_path)
     })
 
     yield
@@ -491,32 +404,22 @@ class QueryResponse(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "Text Generation (RAG) Service running with LOCAL models."}
+    return {"status": "Conversational RAG Service running with LOCAL models."}
 
 @app.get("/status")
 def status():
     vs = ml_models.get("vector_store")
     count = vs_count_estimate(vs) if vs is not None else 0
-    memory = ml_models.get("memory")
-    memory_content = ""
-    if memory is not None:
-        try:
-            memory_data = memory.load_memory_variables({})
-            memory_content = memory_data.get("chat_history", "")
-        except Exception:
-            pass
-            
+    chat_history = ml_models.get("chat_history", [])
+    
     return {
         "vector_store_ready": vs is not None,
-        "vector_store_has_data": count > 0,
         "vector_store_count": int(count),
         "local_llm_ready": ml_models.get("local_llm") is not None,
         "rag_chain_ready": ml_models.get("rag_chain") is not None,
-        "memory_ready": ml_models.get("memory") is not None,
-        "memory_content": memory_content[:200] + "..." if len(memory_content) > 200 else memory_content,
+        "conversation_turns": len(chat_history),
         "model_id": LOCAL_MODEL_ID,
-        "top_k": TOP_K,
-        "csv_found": bool(find_csv_path())
+        "top_k": TOP_K
     }
 
 @app.post("/upload-csv")
@@ -548,19 +451,12 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
         df = df.head(sample_limit)
 
     try:
-        print("[INGEST] Clearing old data from vector store...")
         if hasattr(vs, "_collection"):
             ids_to_delete = vs._collection.get()['ids']
             if ids_to_delete:
                 vs._collection.delete(ids=ids_to_delete)
-                print("[INGEST] Old data cleared.")
-            else:
-                print("[INGEST] Collection was already empty.")
-        else:
-            print("[INGEST] Could not automatically clear old data. Re-ingesting anyway.")
     except Exception:
         traceback.print_exc()
-        print("[INGEST] Error clearing data, re-ingesting may result in duplicates.")
 
     ok, info = ingest_dataframe(df, vs, batch_docs=batch_size)
     if not ok:
@@ -581,111 +477,62 @@ def get_csv_columns():
 
 @app.post("/reset-memory")
 def reset_memory():
-    memory = ml_models.get("memory")
-    if memory is not None:
-        try:
-            memory.clear()
-            print("[MEMORY] Global memory cleared.")
-            return {"status": "memory_cleared"}
-        except Exception as e:
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=f"Failed to clear memory: {e}")
-    return {"status": "no_memory_object_to_clear"}
+    ml_models["chat_history"] = []
+    print("[MEMORY] Chat history cleared.")
+    return {"status": "memory_cleared", "message": "Conversation history has been reset"}
 
 @app.post("/generate-text", response_model=QueryResponse)
 async def generate_text(req: QueryRequest):
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
-    vs = ml_models.get("vector_store")
-    local_llm = ml_models.get("local_llm") or ml_models.get("hf_pipeline")
-    memory = ml_models.get("memory")
+    rag_chain = ml_models.get("rag_chain")
+    chat_history = ml_models.get("chat_history", [])
 
-    if local_llm is None:
-        raise HTTPException(status_code=503, detail="No local LLM available.")
+    if rag_chain is None:
+        raise HTTPException(status_code=503, detail="RAG chain not available.")
 
-    # Step 1: Load chat history FIRST
-    chat_history = ""
-    if memory is not None:
-        try:
-            memory_data = memory.load_memory_variables({})
-            chat_history = memory_data.get("chat_history", "")
-            print(f"[MEMORY] Loaded chat history: '{chat_history}'")
-        except Exception as e:
-            print(f"[MEMORY] Error loading memory: {e}")
-
-    # Step 2: Check if this is a conversational follow-up question
-    is_conversational_question = any(keyword in req.query.lower() for keyword in [
-        'previous', 'we were discussing', 'we discussed', 'before', 'earlier', 
-        'last time', 'what was', 'tell me more about what we talked'
-    ])
-    
-    # Step 3: Retrieve context from database (but skip for conversational questions with existing history)
-    context_text = ""
-    retrieved_docs = []
-
-    if vs is not None and not (is_conversational_question and chat_history.strip()):
-        try:
-            print(f"[LOGIC] Retrieving TOP_K={TOP_K} docs for query...")
-            retriever = vs.as_retriever(search_kwargs={"k": TOP_K})
-            
-            if hasattr(retriever, "get_relevant_documents"):
-                retrieved_docs = retriever.get_relevant_documents(req.query)
-            elif hasattr(retriever, "retrieve"):
-                retrieved_docs = retriever.retrieve(req.query)
-            else:
-                retrieved_docs = retriever(req.query) if callable(retriever) else []
-            
-            if retrieved_docs:
-                context_text = "\n\n".join([getattr(d, "page_content", str(d)) for d in retrieved_docs])
-                print(f"[LOGIC] Found {len(retrieved_docs)} relevant docs.")
-            else:
-                context_text = "(No relevant data context found in database)"
-        except Exception as e:
-            traceback.print_exc()
-            context_text = "(Error during context retrieval)"
-    else:
-        if is_conversational_question and chat_history.strip():
-            print("[LOGIC] Skipping database retrieval for conversational question with existing history")
-            context_text = "(Skipped retrieval - using conversation history)"
-        else:
-            context_text = "(Vector store not available)"
-
-    # Step 4: Build the combined prompt with chat history, context, and question
-    formatted_prompt = build_fallback_prompt(chat_history, context_text, req.query)
-    print(f"[PROMPT] Sending prompt to LLM (first 300 chars): {formatted_prompt[:300]}...")
-
-    # Step 5: Send to LLM
-    generated = send_to_llm(local_llm, formatted_prompt)
-    if not generated:
-        raise HTTPException(status_code=500, detail="LLM produced no output.")
-
-    # Step 6: Clean up the response
-    generated = generated.strip()
-    
-    # Remove common prefixes
-    prefixes_to_remove = ["Response:", "Answer:", "Explanation:", "Summary:"]
-    for prefix in prefixes_to_remove:
-        if generated.lower().startswith(prefix.lower()):
-            generated = generated[len(prefix):].strip()
-            break
-    
-    # Remove any leading/trailing quotes
-    generated = generated.strip('"\'')
-    
-    print(f"[RESPONSE] Cleaned response: {generated}")
-
-    # Step 7: Save to memory
-    if memory is not None:
-        try:
-            # Save the new conversation turn
-            memory.save_context({"question": req.query}, {"answer": generated})
-            print(f"[MEMORY] Saved to memory - Question: '{req.query}', Answer: '{generated}'")
-        except Exception as e:
-            print(f"[MEMORY] Error saving memory: {e}")
-            traceback.print_exc()
-
-    return QueryResponse(answer=generated)
+    try:
+        print(f"\n[QUERY] User question: {req.query}")
+        print(f"[HISTORY] Current history length: {len(chat_history)} turns")
+        
+        # ConversationalRetrievalChain expects chat_history as list of tuples
+        result = rag_chain({
+            "question": req.query,
+            "chat_history": chat_history
+        })
+        
+        answer = result.get("answer", "").strip()
+        
+        # Clean up answer
+        if not answer:
+            answer = "I'm sorry, I couldn't generate an answer based on the available information."
+        
+        # Remove any prompt artifacts
+        for prefix in ["Helpful Answer:", "Answer:", "Response:", req.query]:
+            if answer.startswith(prefix):
+                answer = answer[len(prefix):].strip()
+                answer = answer.lstrip(':').strip()
+        
+        answer = answer.strip('"\'')
+        
+        print(f"[ANSWER] Generated: {answer}")
+        
+        # Update chat history - CRITICAL FORMAT: list of (question, answer) tuples
+        chat_history.append((req.query, answer))
+        
+        # Keep only last 5 turns to avoid context overflow
+        if len(chat_history) > 5:
+            chat_history.pop(0)
+        
+        print(f"[HISTORY] Updated history length: {len(chat_history)} turns\n")
+        
+        return QueryResponse(answer=answer)
+        
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
 
 if __name__ == "__main__":
-    print("Run: uvicorn main:app --host 0.0.0.0 --port 8002")
+    print("Run: uvicorn main:app --host 0.0.0.0 --port 8002 --reload")
