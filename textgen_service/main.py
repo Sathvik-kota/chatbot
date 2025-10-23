@@ -97,8 +97,8 @@ chat_prompt_obj = None
 # This text_template will be our primary template, formatted as a single string.
 # NOW INCLUDES "chat_history"
 text_template = """You are a helpful cybersecurity expert assistant.
-
-Review the 'Chat History' and 'Context from database' to answer the 'Question'.
+You will be given 'Chat History', a 'Question', and 'Context from database'.
+The 'Context from database' contains raw data logs and examples, NOT definitions.
 
 Chat History:
 {chat_history}
@@ -109,10 +109,10 @@ Context from database:
 Question: {question}
 
 Instructions for your answer:
-1. First, try to answer the 'Question' using ONLY the 'Context from database'.
-2. If the 'Context' is empty or does not provide a relevant answer, then use your general knowledge to answer the 'Question'.
-3. If you use your general knowledge, just provide the answer. Do not apologize for the context being empty.
-4. Be helpful and provide a clear, concise answer.
+1.  Read the 'Question' carefully.
+2.  If the 'Question' is a general definition (e.g., "What is a DDoS attack?", "What does vulnerability mean?"), **IGNORE the 'Context from database'** and answer using your own general knowledge.
+3.  If the 'Question' is specific about the data (e.g., "List all attacks", "What was the response for the DDoS attack?"), use the 'Context from database' to find and present the answer.
+4.  Provide a clear, helpful answer.
 
 Answer:"""
 
@@ -677,5 +677,4 @@ async def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn main:app --host 0.0.0.0 --port 8002")
-
 
