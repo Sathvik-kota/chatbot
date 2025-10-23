@@ -97,8 +97,7 @@ chat_prompt_obj = None
 # This text_template will be our primary template, formatted as a single string.
 # NOW INCLUDES "chat_history"
 text_template = """You are a helpful cybersecurity expert assistant.
-You will be given 'Chat History', a 'Question', and 'Context from database'.
-The 'Context from database' contains raw data logs and examples, NOT definitions.
+Answer the 'Question' based on the 'Chat History' and 'Context from database' if relevant, or your own knowledge if not.
 
 Chat History:
 {chat_history}
@@ -107,12 +106,6 @@ Context from database:
 {context}
 
 Question: {question}
-
-Instructions for your answer:
-1.  Read the 'Question' carefully.
-2.  If the 'Question' is a general definition (e.g., "What is a DDoS attack?", "What does vulnerability mean?"), **IGNORE the 'Context from database'** and answer using your own general knowledge.
-3.  If the 'Question' is specific about the data (e.g., "List all attacks", "What was the response for the DDoS attack?"), use the 'Context from database' to find and present the answer.
-4.  Provide a clear, helpful answer.
 
 Answer:"""
 
