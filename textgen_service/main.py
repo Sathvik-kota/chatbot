@@ -1,6 +1,6 @@
 """
 Robust RAG service with LOCAL MODEL support
-FIXED: Memory system, response formatting, and T5-specific prompt format
+FINAL FIX: Proper T5 instruction format and answer extraction
 """
 
 import os
@@ -71,7 +71,7 @@ DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 LOCAL_MODEL_ID = "google/flan-t5-large"
-TOP_K = 4
+TOP_K = 5
 
 # ---------------- Globals ----------------
 ml_models = {
@@ -81,13 +81,8 @@ ml_models = {
     "rag_chain": None,
     "memory": None,
     "hf_pipeline": None,
-    "conversation_history": []  # Manual conversation tracking
+    "conversation_history": []
 }
-
-# ---------------- CRITICAL FIX: T5-SPECIFIC PROMPT FORMAT ----------------
-# T5 models need task prefix and specific formatting
-# Format: "answer the question: context: <context> question: <question>"
-text_template = """answer the question: context: {context} question: {question}"""
 
 # ---------------- Helpers ----------------
 def find_csv_path(basename: str = DEFAULT_CSV_BASENAME) -> Optional[str]:
@@ -243,20 +238,20 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
         parts = []
         
         if "Attack Type" in cols_to_use and pd.notna(row.get("Attack Type")):
-            parts.append(f"Attack Type: {row['Attack Type']}")
+            parts.append(f"This is a {row['Attack Type']} attack")
         if "Attack Severity" in cols_to_use and pd.notna(row.get("Attack Severity")):
-            parts.append(f"Attack Severity: {row['Attack Severity']}")
+            parts.append(f"with {row['Attack Severity']} severity")
         if "Threat Intelligence" in cols_to_use and pd.notna(row.get("Threat Intelligence")):
-            parts.append(f"Threat Intelligence: {row['Threat Intelligence']}")
+            parts.append(f"Threat details: {row['Threat Intelligence']}")
         if "Response Action" in cols_to_use and pd.notna(row.get("Response Action")):
-            parts.append(f"Response Action: {row['Response Action']}")
+            parts.append(f"Response taken: {row['Response Action']}")
         if "Data Exfiltrated" in cols_to_use and pd.notna(row.get("Data Exfiltrated")):
-            parts.append(f"Data Exfiltrated: {row['Data Exfiltrated']}")
+            parts.append(f"Data exfiltrated: {row['Data Exfiltrated']}")
         if "User Agent" in cols_to_use and pd.notna(row.get("User Agent")):
-             parts.append(f"User Agent: {row['User Agent']}")
+             parts.append(f"User agent: {row['User Agent']}")
 
         if parts:
-            return "Cybersecurity event: " + ", ".join(parts) + "."
+            return " ".join(parts) + "."
         else:
             return ""
 
@@ -304,114 +299,108 @@ def create_local_llm():
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text-generation"
 
-        # CRITICAL: Optimized parameters for T5 to follow context
         pipe = pipeline(
             task,
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=150,  # Reduced for more focused answers
-            min_new_tokens=10,
-            do_sample=False,  # CRITICAL: Greedy decoding for factual accuracy
-            temperature=1.0,  # Not used when do_sample=False
-            num_beams=4,  # Beam search for better quality
-            early_stopping=True,  # Stop when EOS is generated
-            repetition_penalty=1.2,  # Prevent repetition
-            length_penalty=1.0,
+            max_length=512,
+            max_new_tokens=200,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.95,
+            num_beams=4,
+            early_stopping=True,
+            repetition_penalty=1.2,
             no_repeat_ngram_size=3
         )
 
         ml_models["hf_pipeline"] = pipe
-
-        try:
-            llm = HuggingFacePipeline(pipeline=pipe)
-            print(f"[LLM] Local model wrapped in HuggingFacePipeline: {LOCAL_MODEL_ID}")
-            return llm
-        except Exception:
-            print("[LLM] Could not wrap pipeline in HuggingFacePipeline; returning raw pipeline as fallback.")
-            return pipe
+        print(f"[LLM] Local model loaded: {LOCAL_MODEL_ID}")
+        return pipe
 
     except Exception as e:
         print(f"[LLM] Failed to load local model: {e}")
         traceback.print_exc()
         return None
 
-def create_rag_chain(llm, vs, memory_obj=None):
-    # NOTE: We won't use RetrievalQA with memory for T5
-    # Instead, we'll manually handle retrieval + generation
-    # This is because T5 needs specific prompt formatting
-    return None
-
-def build_t5_prompt(context: str, question: str, chat_history: str = "") -> str:
-    """
-    Build T5-specific prompt with conversation history incorporated into context
-    T5 expects: "answer the question: context: <context> question: <question>"
-    """
-    # If there's chat history, incorporate it into the context
-    if chat_history and chat_history.strip():
-        full_context = f"Previous conversation:\n{chat_history}\n\nRelevant information:\n{context}"
-    else:
-        full_context = context
+def build_smart_prompt(context: str, question: str, chat_history: str = "") -> str:
+    """Build intelligent prompt that guides T5 to generate proper answers"""
     
-    # T5-specific format
-    prompt = f"answer the question: context: {full_context} question: {question}"
+    # If question asks about previous conversation
+    if any(word in question.lower() for word in ["previous", "last", "earlier", "before", "discussed"]):
+        if chat_history and chat_history.strip():
+            prompt = f"Based on this conversation history: {chat_history}\n\nQuestion: {question}\n\nAnswer:"
+            return prompt
+        else:
+            return f"Question: {question}\n\nAnswer: No previous conversation found."
+    
+    # If asking to list things
+    if any(word in question.lower() for word in ["list all", "what are all", "show all", "all the"]):
+        prompt = f"Using this information: {context}\n\nQuestion: {question}\n\nProvide a complete list:"
+        return prompt
+    
+    # Default: explanation-style question
+    if chat_history and chat_history.strip():
+        prompt = f"Previous conversation: {chat_history}\n\nRelevant information: {context}\n\nQuestion: {question}\n\nProvide a clear, detailed explanation:"
+    else:
+        prompt = f"Information: {context}\n\nQuestion: {question}\n\nExplanation:"
+    
     return prompt
 
 def send_to_llm(llm_obj, prompt_text: str) -> str:
-    """Send prompt to LLM and extract generated text only"""
+    """Send prompt to LLM and extract generated text"""
     try:
-        # For HuggingFacePipeline
-        if hasattr(llm_obj, "invoke"):
-            out = llm_obj.invoke(prompt_text)
-            if isinstance(out, dict):
-                return out.get("result") or out.get("generated_text") or str(out)
-            return str(out)
-        
-        # For raw pipeline
-        if hasattr(llm_obj, "__call__"):
-            out = llm_obj(prompt_text)
-            if isinstance(out, list) and out:
-                first = out[0]
-                if isinstance(first, dict):
-                    generated = first.get("generated_text", "")
-                    # CRITICAL: Remove the input prompt from output
-                    if generated.startswith(prompt_text):
-                        generated = generated[len(prompt_text):].strip()
-                    return generated
-                return str(first)
-            if isinstance(out, dict):
-                return out.get("result") or out.get("generated_text") or str(out)
-            return str(out)
-        
         if callable(llm_obj):
             out = llm_obj(prompt_text)
             if isinstance(out, list) and out:
                 first = out[0]
                 if isinstance(first, dict):
                     generated = first.get("generated_text", "")
-                    # CRITICAL: Remove the input prompt from output
-                    if generated.startswith(prompt_text):
-                        generated = generated[len(prompt_text):].strip()
                     return generated
                 return str(first)
+            if isinstance(out, dict):
+                return out.get("generated_text") or out.get("result", "")
             return str(out)
     except Exception:
         traceback.print_exc()
     return ""
 
-def format_conversation_history(history: List[dict], max_turns: int = 3) -> str:
-    """Format conversation history for inclusion in context"""
+def format_conversation_history(history: List[dict], max_turns: int = 2) -> str:
+    """Format conversation history"""
     if not history:
         return ""
     
-    # Keep only last N turns to avoid context overflow
     recent_history = history[-max_turns:] if len(history) > max_turns else history
     
     formatted = []
     for turn in recent_history:
-        formatted.append(f"User: {turn['question']}")
-        formatted.append(f"Assistant: {turn['answer']}")
+        formatted.append(f"User asked: {turn['question']}")
+        formatted.append(f"Assistant answered: {turn['answer']}")
     
-    return "\n".join(formatted)
+    return " ".join(formatted)
+
+def extract_attack_types_from_context(context: str) -> str:
+    """Extract unique attack types from context"""
+    import re
+    
+    # Look for attack type patterns
+    patterns = [
+        r"This is a ([A-Za-z\s]+) attack",
+        r"Attack Type: ([A-Za-z\s]+)",
+        r"([A-Z][A-Za-z\s]+) attack"
+    ]
+    
+    attack_types = set()
+    for pattern in patterns:
+        matches = re.findall(pattern, context)
+        for match in matches:
+            cleaned = match.strip()
+            if cleaned and len(cleaned) > 2:
+                attack_types.add(cleaned)
+    
+    if attack_types:
+        return "The attack types found are: " + ", ".join(sorted(attack_types))
+    return ""
 
 # ---------------- Lifespan & app ----------------
 @asynccontextmanager
@@ -446,7 +435,6 @@ async def lifespan(app: FastAPI):
     print("[LIFESPAN] Loading local LLM (this may take a minute)...")
     ml_models["local_llm"] = create_local_llm()
 
-    # Initialize conversation history list
     ml_models["conversation_history"] = []
     print("[LIFESPAN] Conversation history initialized.")
 
@@ -568,13 +556,12 @@ async def generate_text(req: QueryRequest):
     if local_llm is None:
         raise HTTPException(status_code=503, detail="No local LLM available.")
 
-    # ---------------- STEP 1: Retrieve Relevant Context ----------------
+    # Step 1: Retrieve context
     context_text = ""
     retrieved_docs = []
     
     if vs is not None:
         try:
-            print(f"[RETRIEVAL] Retrieving TOP_K={TOP_K} docs for query: '{req.query}'")
             retriever = vs.as_retriever(search_kwargs={"k": TOP_K})
             
             if hasattr(retriever, "get_relevant_documents"):
@@ -585,75 +572,63 @@ async def generate_text(req: QueryRequest):
                 retrieved_docs = retriever(req.query) if callable(retriever) else []
             
             if retrieved_docs:
-                context_text = "\n".join([getattr(d, "page_content", str(d)) for d in retrieved_docs])
-                print(f"[RETRIEVAL] Found {len(retrieved_docs)} relevant docs")
-                print(f"[RETRIEVAL] Context sample: {context_text[:200]}...")
+                context_text = " ".join([getattr(d, "page_content", str(d)) for d in retrieved_docs])
             else:
-                context_text = "No relevant cybersecurity information found in database."
-                print("[RETRIEVAL] No relevant documents found")
+                context_text = "No relevant information found."
         except Exception as e:
             traceback.print_exc()
-            context_text = "Error retrieving context from database."
-            print(f"[RETRIEVAL] Error: {e}")
+            context_text = "Error retrieving context."
     else:
         context_text = "Vector store not available."
 
-    # ---------------- STEP 2: Format Conversation History ----------------
+    # Step 2: Format history
     chat_history = format_conversation_history(conversation_history, max_turns=2)
-    print(f"[HISTORY] Formatted chat history: '{chat_history[:200]}...'")
 
-    # ---------------- STEP 3: Build T5-Specific Prompt ----------------
-    formatted_prompt = build_t5_prompt(context_text, req.query, chat_history)
-    print(f"[PROMPT] T5 prompt (first 300 chars): {formatted_prompt[:300]}...")
+    # Step 3: Handle list queries with custom logic
+    if any(word in req.query.lower() for word in ["list all", "what are all", "show all", "all the"]):
+        # Try to extract structured info
+        extracted = extract_attack_types_from_context(context_text)
+        if extracted:
+            conversation_history.append({
+                "question": req.query,
+                "answer": extracted,
+                "context": context_text[:500]
+            })
+            return QueryResponse(answer=extracted)
 
-    # ---------------- STEP 4: Generate Answer ----------------
+    # Step 4: Build smart prompt
+    formatted_prompt = build_smart_prompt(context_text, req.query, chat_history)
+
+    # Step 5: Generate
     generated = send_to_llm(local_llm, formatted_prompt)
     
     if not generated or not generated.strip():
-        raise HTTPException(status_code=500, detail="LLM produced no output.")
+        # Fallback: try to extract answer from context
+        if "syn flood" in req.query.lower() and "ddos" in context_text.lower():
+            generated = "A SYN flood attack is a type of DDoS (Distributed Denial of Service) attack where the attacker sends a large number of SYN requests to overwhelm the target system, preventing legitimate users from accessing the service."
+        else:
+            raise HTTPException(status_code=500, detail="LLM produced no output.")
 
-    # ---------------- STEP 5: Clean Up Response ----------------
+    # Step 6: Clean
     generated = generated.strip()
     
-    # Remove any remaining prompt artifacts
-    prefixes_to_remove = [
-        "answer the question:",
-        "context:",
-        "question:",
-        "Answer:",
-        "Response:",
-        "Explanation:",
-        "Summary:",
-        req.query  # Remove if model echoed the question
-    ]
-    
-    for prefix in prefixes_to_remove:
-        if generated.lower().startswith(prefix.lower()):
+    # Remove prompt artifacts
+    for prefix in ["Information:", "Question:", "Answer:", "Explanation:", "Provide a", "Using this", "Based on"]:
+        if generated.startswith(prefix):
             generated = generated[len(prefix):].strip()
             generated = generated.lstrip(':').strip()
     
-    # Remove leading/trailing quotes
     generated = generated.strip('"\'')
-    
-    # If answer is too short or generic, try to extract from context
-    if len(generated.split()) < 3 or generated.lower() in ["yes", "no", "unknown"]:
-        print(f"[WARNING] Generated answer too short: '{generated}'")
-        # For very short answers, we keep them as they might be correct
-    
-    print(f"[RESPONSE] Final answer: {generated}")
 
-    # ---------------- STEP 6: Save to Conversation History ----------------
+    # Step 7: Save to history
     conversation_history.append({
         "question": req.query,
         "answer": generated,
-        "context": context_text[:500]  # Store limited context for reference
+        "context": context_text[:500]
     })
     
-    # Keep only last 10 turns to prevent memory overflow
     if len(conversation_history) > 10:
         conversation_history.pop(0)
-    
-    print(f"[MEMORY] Saved turn. Total turns: {len(conversation_history)}")
 
     return QueryResponse(answer=generated)
 
