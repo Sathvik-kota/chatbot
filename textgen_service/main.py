@@ -1,17 +1,15 @@
 """
-Robust RAG service with OpenAI GPT-4o-mini
-Uses ChatPromptTemplate and a ChatOpenAI model to provide
-a robust, conversational RAG experience.
+Robust RAG service with LOCAL MODEL support
+Uses PromptTemplate to format a single string input for T5 models.
+NOW WITH CONVERSATIONAL MEMORY.
 
 Key Updates:
-- MODEL UPGRADE: Switched from flan-t5-large to gpt-4o-mini.
-  This requires the OPENAI_API_KEY environment variable to be set.
-- PROMPT: Replaced string PromptTemplate with ChatPromptTemplate
-  to use System/Human roles.
-- MEMORY: Updated ConversationBufferMemory to return_messages=True.
-- LOGIC: Removed RetrievalQA chain. The /generate-text endpoint
-  now manually builds the message list (with conditional context)
-  and calls the LLM directly for more control and accuracy.
+- MODEL UPGRADE: Switched from flan-t5-base to flan-t5-large.
+  The 'base' model was not powerful enough to answer general questions
+  and was hallucinating. 'large' should fix this.
+- TOP_K set to 4 as requested.
+- ingest_dataframe now formats CSV rows into natural language sentences.
+- /generate-text endpoint now contains all-new conditional logic.
 """
 import os
 import traceback
@@ -23,10 +21,12 @@ from contextlib import asynccontextmanager
 
 # --- Try imports (be tolerant across environments) ---
 try:
-    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+    from langchain.prompts import PromptTemplate
 except Exception:
-    ChatPromptTemplate = None
-    MessagesPlaceholder = None
+    try:
+        from langchain_core.prompts import PromptTemplate
+    except Exception:
+        PromptTemplate = None
 
 try:
     from langchain.memory import ConversationBufferMemory
@@ -47,17 +47,28 @@ except Exception:
     LC_Chroma = None
 
 try:
-    from langchain_openai import ChatOpenAI
+    from langchain_huggingface import HuggingFacePipeline
 except Exception:
-    ChatOpenAI = None
+    try:
+        from langchain_community.llms import HuggingFacePipeline
+    except Exception:
+        HuggingFacePipeline = None
 
 try:
-    from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+    from langchain.chains import RetrievalQA
 except Exception:
-    SystemMessage = None
-    HumanMessage = None
-    AIMessage = None
+    try:
+        from langchain_community.chains import RetrievalQA
+    except Exception:
+        RetrievalQA = None
 
+try:
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, pipeline
+except Exception:
+    AutoTokenizer = None
+    AutoModelForSeq2SeqLM = None
+    AutoModelForCausalLM = None
+    pipeline = None
 
 # ---------------- Config ----------------
 ROOT_DIR = os.path.dirname(__file__) or os.getcwd()
@@ -68,7 +79,8 @@ DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 # --- MODEL UPGRADE ---
-OPENAI_MODEL_NAME = "gpt-4o-mini"
+# 'base' was not powerful enough. Using 'large' to get better general knowledge.
+LOCAL_MODEL_ID = "google/flan-t5-large"
 
 # --- USER REQUEST: Set TOP_K to 4 ---
 TOP_K = 4
@@ -77,20 +89,30 @@ TOP_K = 4
 ml_models = {
     "embedding_function": None,
     "vector_store": None,
-    "llm": None,  # This will now be the ChatOpenAI model
+    "local_llm": None,  # LangChain HuggingFacePipeline wrapper (if used)
+    "rag_chain": None, # We will bypass this, but keep it as a potential fallback
     "memory": None, # Global memory object
+    # optional direct pipeline store (not required)
+    "hf_pipeline": None
 }
-chat_prompt_obj = None # Will be initialized in lifespan
 
 # ---------------- Chat prompt setup ----------------
-if ChatPromptTemplate and MessagesPlaceholder:
-    chat_prompt_obj = ChatPromptTemplate.from_messages([
-        ("system", "You are a helpful cybersecurity expert assistant. Answer the user's 'Question' using your general knowledge and the provided 'Chat History'. If 'Context from database' is provided and relevant, use it to answer data-specific questions."),
-        MessagesPlaceholder(variable_name="chat_history"),
-        ("human", "Context from database:\n{context}\n\nQuestion:\n{question}")
-    ])
-else:
-    print("[PROMPT] CRITICAL: langchain_core.prompts not fully loaded. Prompts will fail.")
+# --- NEW, SIMPLER PROMPT ---
+# The complex logic is now in the Python code, not the prompt.
+# This prompt just tells the model what info it has.
+text_template = """You are a helpful cybersecurity expert assistant.
+Answer the user's 'Question' using your general knowledge and the provided 'Chat History'.
+If 'Context from database' is provided and relevant, use it to answer data-specific questions.
+
+Chat History:
+{chat_history}
+
+Context from database:
+{context}
+
+Question: {question}
+
+Answer:"""
 
 # ---------------- Helpers ----------------
 def find_csv_path(basename: str = DEFAULT_CSV_BASENAME) -> Optional[str]:
@@ -308,29 +330,140 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
 
     return True, {"method": method, "docs_added": total_added}
 
-def create_llm():
-    """
-    Creates the ChatOpenAI LLM instance.
-    Requires OPENAI_API_KEY to be set as an environment variable.
-    """
-    if ChatOpenAI is None:
-        print("[LLM] langchain_openai not available.")
+def create_local_llm():
+    if HuggingFacePipeline is None:
+        print("[LLM] HuggingFacePipeline not available.")
         return None
-    
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        print("[LLM] CRITICAL ERROR: OPENAI_API_KEY environment variable not set.")
-        # We return None, and the lifespan/endpoints will handle this
+    if pipeline is None or AutoTokenizer is None or AutoModelForSeq2SeqLM is None:
+        print("[LLM] transformers not available.")
         return None
-        
     try:
-        llm = ChatOpenAI(model_name=OPENAI_MODEL_NAME, temperature=0.3)
-        print(f"[LLM] OpenAI model initialized: {OPENAI_MODEL_NAME}")
-        return llm
+        print(f"[LLM] Loading local model: {LOCAL_MODEL_ID}")
+        tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_ID)
+        if "t5" in LOCAL_MODEL_ID.lower():
+            model = AutoModelForSeq2SeqLM.from_pretrained(LOCAL_MODEL_ID)
+            task = "text2text-generation"
+        else:
+            model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
+            task = "text-generation"
+
+        pipe = pipeline(
+            task,
+            model=model,
+            tokenizer=tokenizer,
+            max_new_tokens=512,
+            min_length=40,
+            temperature=0.3,
+            do_sample=True,
+            top_p=0.95,
+            top_k=50,
+            repetition_penalty=1.3,
+            no_repeat_ngram_size=3,
+            early_stopping=False
+        )
+
+        # Keep a direct hf pipeline as fallback too
+        ml_models["hf_pipeline"] = pipe
+
+        try:
+            llm = HuggingFacePipeline(pipeline=pipe)
+            print(f"[LLM] Local model wrapped in HuggingFacePipeline: {LOCAL_MODEL_ID}")
+            return llm
+        except Exception:
+            print("[LLM] Could not wrap pipeline in HuggingFacePipeline; returning raw pipeline as fallback.")
+            return pipe
+
     except Exception as e:
-        print(f"[LLM] Failed to load OpenAI model: {e}")
+        print(f"[LLM] Failed to load local model: {e}")
         traceback.print_exc()
         return None
+
+def create_rag_chain(llm, vs, memory_obj=None):
+    # This chain will only be used as a fallback if our new logic fails
+    if llm is None or vs is None:
+        print("[RAG] Cannot create chain: llm or vs is None")
+        return None
+    if RetrievalQA is None:
+        print("[RAG] RetrievalQA not available")
+        return None
+    try:
+        prompt_obj = None
+        
+        if prompt_obj is None and PromptTemplate is not None:
+            try:
+                # Update prompt to include chat_history
+                prompt_obj = PromptTemplate(template=text_template, input_variables=["chat_history", "context", "question"])
+                print("[RAG] Using PromptTemplate for chain with memory.")
+            except Exception:
+                traceback.print_exc()
+                prompt_obj = None
+
+        chain_type_kwargs = {}
+        if prompt_obj is not None:
+            chain_type_kwargs["prompt"] = prompt_obj
+
+        rag = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type="stuff",
+            # --- USER REQUEST: Use TOP_K (which is 4) ---
+            retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),
+            chain_type_kwargs=chain_type_kwargs,
+            return_source_documents=True,
+            memory=memory_obj  # Pass the memory object here
+        )
+        print(f"[RAG] RAG chain created successfully with prompt, memory, and TOP_K={TOP_K}")
+        return rag
+    except Exception as e:
+        print(f"[RAG] Failed to create chain: {e}")
+        traceback.print_exc()
+        return None
+
+# Helper to format prompt when we need a plain string prompt (fallback)
+def build_fallback_prompt(chat_history: str, context: str, question: str) -> str:
+    if PromptTemplate is not None:
+         try:
+             prompt_obj = PromptTemplate(template=text_template, input_variables=["chat_history", "context", "question"])
+             return prompt_obj.format(chat_history=chat_history, context=context, question=question)
+         except Exception:
+             pass # Fall through to manual .format()
+    try:
+        # Fallback to direct string formatting
+        return text_template.format(chat_history=chat_history, context=context, question=question)
+    except Exception:
+        # Absolute last resort
+        return f"Chat History: {chat_history}\n\nContext: {context}\n\nQuestion: {question}\n\nAnswer:"
+
+
+# Robust sender to LLM: handle various wrapper interfaces
+def send_to_llm(llm_obj, prompt_text: str) -> str:
+    try:
+        # LangChain HuggingFacePipeline wrapper may have .invoke
+        if hasattr(llm_obj, "invoke"):
+            out = llm_obj.invoke(prompt_text)
+            if isinstance(out, dict):
+                return out.get("result") or out.get("generated_text") or str(out)
+            return str(out)
+        # LangChain wrappers may implement __call__
+        if hasattr(llm_obj, "__call__"):
+            out = llm_obj(prompt_text)
+            # out may be dict or string
+            if isinstance(out, dict):
+                return out.get("result") or out.get("generated_text") or str(out)
+            return str(out)
+        # If it's a raw transformers pipeline (callable), call and extract
+        if callable(llm_obj):
+            out = llm_obj(prompt_text)
+            if isinstance(out, list) and out:
+                first = out[0]
+                if isinstance(first, dict):
+                    # common keys: 'generated_text' or 'summary_text' or 'translation_text'
+                    return first.get("generated_text") or first.get("translation_text") or first.get("summary_text") or str(first)
+                return str(first)
+            return str(out)
+    except Exception:
+        traceback.print_exc()
+    # final fallback
+    return ""
 
 # ---------------- Lifespan & app ----------------
 @asynccontextmanager
@@ -363,27 +496,33 @@ async def lifespan(app: FastAPI):
     else:
         print("[LIFESPAN] Skipping auto-ingest (no vs or no csv)")
 
-    print("[LIFESPAN] Initializing OpenAI LLM...")
-    ml_models["llm"] = create_llm()
-    if ml_models["llm"] is None:
-        print("[LIFESPAN] CRITICAL: LLM failed to initialize. Check OPENAI_API_KEY.")
+    print("[LIFESPAN] Loading local LLM (this may take a minute)...")
+    ml_models["local_llm"] = create_local_llm()
 
     # Create global memory object
     if ConversationBufferMemory is not None:
         ml_models["memory"] = ConversationBufferMemory(
             memory_key="chat_history", 
-            return_messages=True, # MUST be True for Chat Models
-            input_key="question"
+            return_messages=False, # Return history as a string, best for T5
+            input_key="question" # Explicitly tell memory what the input key is
         )
-        print("[LIFESPAN] Global ConversationBufferMemory created (return_messages=True).")
+        print("[LIFESPAN] Global ConversationBufferMemory created.")
     else:
         print("[LIFESPAN] ConversationBufferMemory not available, chain will be stateless.")
+
+    # We still create the RAG chain as a *backup*
+    if ml_models["local_llm"] is not None and vs is not None:
+        ml_models["rag_chain"] = create_rag_chain(
+            ml_models["local_llm"], 
+            vs, 
+            ml_models["memory"] # Pass memory to chain
+        )
 
     print("[LIFESPAN] startup complete:", {
         "vector_store_ready": vs is not None,
         "vector_store_count": vs_count_estimate(vs) if vs is not None else 0,
-        "llm_ready": ml_models.get("llm") is not None,
-        "rag_chain_ready": False, # We are using manual logic, not a chain
+        "local_llm_ready": ml_models.get("local_llm") is not None,
+        "rag_chain_ready": ml_models.get("rag_chain") is not None,
         "memory_ready": ml_models.get("memory") is not None,
         "csv_found": bool(csv_path)
     })
@@ -402,7 +541,7 @@ class QueryResponse(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "Text Generation (RAG) Service running with OpenAI models."}
+    return {"status": "Text Generation (RAG) Service running with LOCAL models."}
 
 @app.get("/status")
 def status():
@@ -412,11 +551,11 @@ def status():
         "vector_store_ready": vs is not None,
         "vector_store_has_data": count > 0,
         "vector_store_count": int(count),
-        "llm_ready": ml_models.get("llm") is not None,
-        "rag_chain_ready": False, # We are using manual logic
+        "local_llm_ready": ml_models.get("local_llm") is not None,
+        "rag_chain_ready": ml_models.get("rag_chain") is not None,
         "memory_ready": ml_models.get("memory") is not None,
-        "model_id": OPENAI_MODEL_NAME,
-        "top_k": TOP_K,
+        "model_id": LOCAL_MODEL_ID,
+        "top_k": TOP_K, # Report the new TOP_K
         "csv_found": bool(find_csv_path())
     }
 
@@ -498,24 +637,24 @@ def reset_memory():
 async def generate_text(req: QueryRequest):
     """
     --- NEW LOGIC ---
-    This function now uses ChatOpenAI and builds a list of messages.
-    It still uses the conditional logic to prevent context-copying.
+    This function now implements conditional logic to prevent
+    context-copying for general questions.
     """
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
     vs = ml_models.get("vector_store")
-    llm = ml_models.get("llm")
+    local_llm = ml_models.get("local_llm") or ml_models.get("hf_pipeline")
     memory = ml_models.get("memory")
 
-    if llm is None:
-        raise HTTPException(status_code=503, detail="OpenAI LLM not available. Check server logs and OPENAI_API_KEY.")
+    if local_llm is None:
+        raise HTTPException(status_code=503, detail="No local LLM available.")
 
     query_str_lower = req.query.strip().lower()
     context_text = ""
     retrieved_docs = []
 
-    # --- CONDITIONAL LOGIC ---
+    # --- NEW CONDITIONAL LOGIC ---
     
     # 1. Define general question triggers
     general_question_triggers = [
@@ -552,62 +691,32 @@ async def generate_text(req: QueryRequest):
         print("[LOGIC] General question detected. Forcing empty context.")
         context_text = "(No context needed for general question)"
 
-    # 3. Load chat history (as messages)
-    chat_history_messages = []
+    # 3. Load chat history
+    chat_history = ""
     if memory is not None:
         try:
-            # This is how you get messages from ConversationBufferMemory
-            chat_history_messages = memory.chat_memory.messages
+            chat_history = memory.load_memory_variables({}).get("chat_history", "")
         except Exception as e:
             print(f"[MEMORY] Error loading memory: {e}")
 
-    # 4. Build the final prompt as a list of messages
-    final_messages = []
-    try:
-        # Use the global ChatPromptTemplate
-        final_prompt_value = chat_prompt_obj.invoke({
-            "chat_history": chat_history_messages,
-            "context": context_text,
-            "question": req.query
-        })
-        final_messages = final_prompt_value.to_messages()
-    except Exception as e:
-        print(f"[PROMPT] Error formatting ChatPromptTemplate: {e}. Building manually.")
-        # Manual fallback
-        if SystemMessage:
-            final_messages.append(SystemMessage(content="You are a helpful cybersecurity expert assistant. Answer the user's 'Question' using your general knowledge and the provided 'Chat History'. If 'Context from database' is provided and relevant, use it to answer data-specific questions."))
-        
-        final_messages.extend(chat_history_messages)
-        
-        if HumanMessage:
-            final_messages.append(HumanMessage(content=f"Context from database:\n{context_text}\n\nQuestion:\n{req.query}"))
-
-    if not final_messages:
-        raise HTTPException(status_code=500, detail="Failed to build prompt messages.")
+    # 4. Build the final prompt
+    formatted_prompt = build_fallback_prompt(chat_history, context_text, req.query)
 
     # 5. Send to LLM
-    try:
-        print(f"[LLM] Invoking {OPENAI_MODEL_NAME} with {len(final_messages)} messages.")
-        response = llm.invoke(final_messages)
-        generated_text = response.content
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"LLM failed to generate a response: {e}")
-
-    if not generated_text:
+    generated = send_to_llm(local_llm, formatted_prompt)
+    if not generated:
         raise HTTPException(status_code=500, detail="LLM produced no output.")
 
     # 6. Save to memory
     if memory is not None:
         try:
-            # We save the *actual* query and response
-            memory.save_context({"question": req.query}, {"answer": generated_text})
+            memory.save_context({"question": req.query}, {"answer": generated})
             print("[MEMORY] Context saved to memory.")
         except Exception as e:
             print(f"[MEMORY] Error saving memory: {e}")
 
-    generated_text = generated_text.strip()
-    return QueryResponse(answer=generated_text)
+    generated = generated.strip()
+    return QueryResponse(answer=generated)
 
 if __name__ == "__main__":
     print("Run: uvicorn main:app --host 0.0.0.0 --port 8002")
