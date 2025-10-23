@@ -1,6 +1,7 @@
 """
 Robust RAG service with LOCAL MODEL support
 Uses PromptTemplate to format a single string input for T5 models.
+NOW WITH CONVERSATIONAL MEMORY.
 """
 import os
 import traceback
@@ -23,6 +24,14 @@ except Exception:
         from langchain_core.prompts import PromptTemplate
     except Exception:
         PromptTemplate = None
+
+try:
+    from langchain.memory import ConversationBufferMemory
+except Exception:
+    try:
+        from langchain_community.memory import ConversationBufferMemory
+    except Exception:
+        ConversationBufferMemory = None
 
 try:
     from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
@@ -75,6 +84,7 @@ ml_models = {
     "vector_store": None,
     "local_llm": None,  # LangChain HuggingFacePipeline wrapper (if used)
     "rag_chain": None,
+    "memory": None, # Global memory object
     # optional direct pipeline store (not required)
     "hf_pipeline": None
 }
@@ -85,22 +95,24 @@ ml_models = {
 chat_prompt_obj = None
 
 # This text_template will be our primary template, formatted as a single string.
-text_template = """You are a cybersecurity expert assistant. Answer the question based ONLY on the provided context from the database.
+# NOW INCLUDES "chat_history"
+text_template = """You are a helpful cybersecurity expert assistant.
+
+Review the 'Chat History' and 'Context from database' to answer the 'Question'.
+
+Chat History:
+{chat_history}
 
 Context from database:
 {context}
 
 Question: {question}
 
-Instructions:
-1. Carefully read ALL the context documents above
-2. If the question asks to "list" or "what are the types", extract ALL UNIQUE items mentioned across all context documents
-3. If the question asks to "explain" or "what is", provide a detailed 3-5 sentence explanation
-4. For listing questions: Create a clear list or enumeration of unique items found in the context
-5. For explanation questions: Provide comprehensive details with examples from the context
-6. NEVER repeat the same item multiple times
-7. If information is not in the context, say "I cannot find this information in the provided context."
-8. Do NOT use general knowledge - use ONLY what's in the context above
+Instructions for your answer:
+1. First, try to answer the 'Question' using ONLY the 'Context from database'.
+2. If the 'Context' is empty or does not provide a relevant answer, then use your general knowledge to answer the 'Question'.
+3. If you use your general knowledge, just provide the answer. Do not apologize for the context being empty.
+4. Be helpful and provide a clear, concise answer.
 
 Answer:"""
 
@@ -331,7 +343,7 @@ def create_local_llm():
         traceback.print_exc()
         return None
 
-def create_rag_chain(llm, vs):
+def create_rag_chain(llm, vs, memory_obj=None):
     if llm is None or vs is None:
         print("[RAG] Cannot create chain: llm or vs is None")
         return None
@@ -344,8 +356,9 @@ def create_rag_chain(llm, vs):
         
         if prompt_obj is None and PromptTemplate is not None:
             try:
-                prompt_obj = PromptTemplate(template=text_template, input_variables=["context", "question"])
-                print("[RAG] Using PromptTemplate for chain.")
+                # Update prompt to include chat_history
+                prompt_obj = PromptTemplate(template=text_template, input_variables=["chat_history", "context", "question"])
+                print("[RAG] Using PromptTemplate for chain with memory.")
             except Exception:
                 traceback.print_exc()
                 prompt_obj = None
@@ -359,9 +372,10 @@ def create_rag_chain(llm, vs):
             chain_type="stuff",
             retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),
             chain_type_kwargs=chain_type_kwargs,
-            return_source_documents=True
+            return_source_documents=True,
+            memory=memory_obj  # Pass the memory object here
         )
-        print("[RAG] RAG chain created successfully with prompt")
+        print("[RAG] RAG chain created successfully with prompt and memory")
         return rag
     except Exception as e:
         print(f"[RAG] Failed to create chain: {e}")
@@ -370,19 +384,19 @@ def create_rag_chain(llm, vs):
 
 # Helper to format prompt when we need a plain string prompt (fallback)
 # This is now our *primary* manual formatting method
-def build_fallback_prompt(context: str, question: str) -> str:
+def build_fallback_prompt(chat_history: str, context: str, question: str) -> str:
     if PromptTemplate is not None:
          try:
-             prompt_obj = PromptTemplate(template=text_template, input_variables=["context", "question"])
-             return prompt_obj.format(context=context, question=question)
+             prompt_obj = PromptTemplate(template=text_template, input_variables=["chat_history", "context", "question"])
+             return prompt_obj.format(chat_history=chat_history, context=context, question=question)
          except Exception:
              pass # Fall through to manual .format()
     try:
         # Fallback to direct string formatting
-        return text_template.format(context=context, question=question)
+        return text_template.format(chat_history=chat_history, context=context, question=question)
     except Exception:
         # Absolute last resort
-        return f"Context: {context}\n\nQuestion: {question}\n\nAnswer:"
+        return f"Chat History: {chat_history}\n\nContext: {context}\n\nQuestion: {question}\n\nAnswer:"
 
 
 # Robust sender to LLM: handle various wrapper interfaces
@@ -448,14 +462,31 @@ async def lifespan(app: FastAPI):
 
     print("[LIFESPAN] Loading local LLM (this may take a minute)...")
     ml_models["local_llm"] = create_local_llm()
+
+    # Create global memory object
+    if ConversationBufferMemory is not None:
+        ml_models["memory"] = ConversationBufferMemory(
+            memory_key="chat_history", 
+            return_messages=False, # Return history as a string, best for T5
+            input_key="question" # Explicitly tell memory what the input key is
+        )
+        print("[LIFESPAN] Global ConversationBufferMemory created.")
+    else:
+        print("[LIFESPAN] ConversationBufferMemory not available, chain will be stateless.")
+
     if ml_models["local_llm"] is not None and vs is not None:
-        ml_models["rag_chain"] = create_rag_chain(ml_models["local_llm"], vs)
+        ml_models["rag_chain"] = create_rag_chain(
+            ml_models["local_llm"], 
+            vs, 
+            ml_models["memory"] # Pass memory to chain
+        )
 
     print("[LIFESPAN] startup complete:", {
         "vector_store_ready": vs is not None,
         "vector_store_count": vs_count_estimate(vs) if vs is not None else 0,
         "local_llm_ready": ml_models.get("local_llm") is not None,
         "rag_chain_ready": ml_models.get("rag_chain") is not None,
+        "memory_ready": ml_models.get("memory") is not None,
         "csv_found": bool(csv_path)
     })
 
@@ -485,6 +516,7 @@ def status():
         "vector_store_count": int(count),
         "local_llm_ready": ml_models.get("local_llm") is not None,
         "rag_chain_ready": ml_models.get("rag_chain") is not None,
+        "memory_ready": ml_models.get("memory") is not None,
         "model_id": LOCAL_MODEL_ID,
         "top_k": TOP_K,
         "csv_found": bool(find_csv_path())
@@ -545,6 +577,23 @@ def get_csv_columns():
         raise HTTPException(status_code=400, detail="CSV empty or unreadable.")
     return {"columns": list(df.columns)}
 
+@app.post("/reset-memory")
+def reset_memory():
+    """
+    Clears the global conversation history.
+    """
+    memory = ml_models.get("memory")
+    if memory is not None:
+        try:
+            memory.clear()
+            print("[MEMORY] Global memory cleared.")
+            return {"status": "memory_cleared"}
+        except Exception as e:
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail=f"Failed to clear memory: {e}")
+    return {"status": "no_memory_object_to_clear"}
+
+
 @app.post("/generate-text", response_model=QueryResponse)
 async def generate_text(req: QueryRequest):
     """
@@ -553,7 +602,7 @@ async def generate_text(req: QueryRequest):
     if not req.query or not req.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty.")
 
-    # Prefer using the RAG chain if available (it already has the prompt)
+    # Prefer using the RAG chain if available (it already has the prompt and memory)
     rag = ml_models.get("rag_chain")
     if rag is not None:
         try:
@@ -575,6 +624,7 @@ async def generate_text(req: QueryRequest):
     # Manual flow: retrieve context and format PromptTemplate
     vs = ml_models.get("vector_store")
     local_llm = ml_models.get("local_llm") or ml_models.get("hf_pipeline")
+    memory = ml_models.get("memory")
     context_text = ""
     if vs is not None:
         try:
@@ -591,9 +641,18 @@ async def generate_text(req: QueryRequest):
                 context_text = "\n\n".join([getattr(d, "page_content", str(d)) for d in docs])
         except Exception:
             traceback.print_exc()
+    
+    # --- Manual Memory Handling (for fallback) ---
+    chat_history = ""
+    if memory is not None:
+        try:
+            # Load history
+            chat_history = memory.load_memory_variables({}).get("chat_history", "")
+        except Exception as e:
+            print(f"[MEMORY] Error loading memory: {e}")
 
     # Format prompt: We only use the single-string text_template
-    formatted_prompt = build_fallback_prompt(context_text, req.query)
+    formatted_prompt = build_fallback_prompt(chat_history, context_text, req.query)
 
     # Send prompt to LLM (local wrapper or direct pipeline)
     if local_llm is None:
@@ -603,9 +662,20 @@ async def generate_text(req: QueryRequest):
     if not generated:
         raise HTTPException(status_code=500, detail="LLM produced no output.")
 
+    # --- Manual Memory Handling (for fallback) ---
+    if memory is not None:
+        try:
+            # Save context
+            memory.save_context({"question": req.query}, {"answer": generated})
+            print("[MEMORY] Manual flow saved to memory.")
+        except Exception as e:
+            print(f"[MEMORY] Error saving memory: {e}")
+
+
     generated = generated.strip()
     return QueryResponse(answer=generated)
 
 if __name__ == "__main__":
     print("Run: uvicorn main:app --host 0.0.0.0 --port 8002")
+
 
