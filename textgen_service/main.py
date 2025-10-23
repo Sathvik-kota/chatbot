@@ -1,27 +1,5 @@
 """
 Robust RAG service with LOCAL MODEL support
-FIXED: Proper memory handling and response formatting
-"""
-
-import os
-import traceback
-import pandas as pd
-from typing import Optional, List
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Request
-from pydantic import BaseModel
-from contextlib import asynccontextmanager
-
-# ... (keep all imports the same)
-
-# ---------------- Config ----------------
-ROOT_DIR = os.path.dirname(__file__) or os.getcwd()
-CHROMA_DB_PATH = os.path.join(ROOT_DIR, "chroma_db")
-DOCUMENTS_DIR = os.path.join(ROPASTED_CODE_HERE
-Let me provide the complete fixed code:
-
-```python
-"""
-Robust RAG service with LOCAL MODEL support
 FIXED: Memory system and response formatting
 """
 
@@ -687,10 +665,6 @@ async def generate_text(req: QueryRequest):
     # Save to memory - use the exact format LangChain expects
     if memory is not None:
         try:
-            # Clear any existing temporary buffer
-            if hasattr(memory, 'clear'):
-                memory.clear()
-            
             # Save the new conversation turn
             memory.save_context({"question": req.query}, {"answer": generated})
             print(f"[MEMORY] Saved to memory - Question: '{req.query}', Answer: '{generated}'")
