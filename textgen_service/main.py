@@ -36,7 +36,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- Paths and Model Settings ---
 # IMPORTANT: Update these paths to match your environment
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
-MODEL_PATH = os.getenv("MODEL_PATH", "./models/mistral-7b-instruct-v0.2.Q4_K_M.gguf") # Download a GGUF model
+MODEL_PATH = os.getenv("MODEL_PATH", "/home/user/my-models/mistral-7b-instruct-v0.2.Q4_K_M.gguf")
 VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", os.path.join(ROOT_DIR, "vectorstores/cyber_faiss"))
 CYBER_CSV_PATH = os.getenv("CYBER_CSV_PATH", "/content/project/textgen_service/ai_cybersecurity_dataset-sampled-5k.csv")
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
