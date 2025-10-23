@@ -1,3 +1,8 @@
+"""
+Robust RAG service with LOCAL MODEL support
+FIXED: Smart context retrieval that handles conversational questions properly
+"""
+
 import os
 import traceback
 import pandas as pd
@@ -78,7 +83,7 @@ ml_models = {
     "hf_pipeline": None
 }
 
-# ---------------- IMPROVED PROMPT WITH MEMORY AWARENESS ----------------
+# ---------------- IMPROVED PROMPT ----------------
 text_template = """You are a cybersecurity expert assistant having a conversation with a user.
 
 Previous Conversation:
@@ -89,12 +94,13 @@ Context from database:
 
 Current Question: {question}
 
-Provide a helpful, detailed answer. If the question references previous conversation, make sure to acknowledge it and connect your answer to what was discussed before.
+Provide a helpful, detailed answer. If the question is about previous conversation, use the chat history to answer.
+If the question is about cybersecurity data, use the database context when relevant.
+Otherwise, use your general cybersecurity knowledge.
 
 Answer:"""
 
 # ---------------- Helpers ----------------
-
 def find_csv_path(basename: str = DEFAULT_CSV_BASENAME) -> Optional[str]:
     candidates = [
         HARDCODED_CSV_PATH,
@@ -233,10 +239,10 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
         "Response Action",
         "User Agent"
     ]
-
+    
     df_cols_lower = {col.lower(): col for col in df.columns}
     cols_to_use = [df_cols_lower[c.lower()] for c in USEFUL_COLUMNS if c.lower() in df_cols_lower]
-
+    
     if not cols_to_use:
         print("[INGEST] ERROR: Could not find expected text columns.")
         print(f"[INGEST] Available columns: {list(df.columns)}")
@@ -246,11 +252,20 @@ def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
 
     def create_doc(row):
         parts = ["A cybersecurity event was recorded"]
+        
+        if "Attack Type" in cols_to_use and pd.notna(row["Attack Type"]):
+            parts.append(f"Attack Type: {row['Attack Type']}")
+        if "Attack Severity" in cols_to_use and pd.notna(row["Attack Severity"]):
+            parts.append(f"Severity: {row['Attack Severity']}")
+        if "Threat Intelligence" in cols_to_use and pd.notna(row["Threat Intelligence"]):
+            parts.append(f"Threat Intelligence: {row['Threat Intelligence']}")
+        if "Response Action" in cols_to_use and pd.notna(row["Response Action"]):
+            parts.append(f"Response: {row['Response Action']}")
+        if "Data Exfiltrated" in cols_to_use and pd.notna(row["Data Exfiltrated"]):
+            parts.append(f"Data Exfiltrated: {row['Data Exfiltrated']}")
+        if "User Agent" in cols_to_use and pd.notna(row["User Agent"]):
+             parts.append(f"User Agent: {row['User Agent']}")
 
-        def _has(col): return col in row and pd.notna(row[col])
-        for col in cols_to_use:
-            if _has(col):
-                parts.append(f"{col}: {row[col]}")
         if len(parts) > 1:
             return parts[0] + ": " + ", ".join(parts[1:]) + "."
         else:
@@ -339,7 +354,7 @@ def create_rag_chain(llm, vs, memory_obj=None):
         return None
     try:
         prompt_obj = None
-
+        
         if prompt_obj is None and PromptTemplate is not None:
             try:
                 prompt_obj = PromptTemplate(template=text_template, input_variables=["chat_history", "context", "question"])
@@ -368,20 +383,13 @@ def create_rag_chain(llm, vs, memory_obj=None):
         return None
 
 def build_fallback_prompt(chat_history: str, context: str, question: str) -> str:
-    """Always combine latest memory, context, and current question for new prompt."""
+    if PromptTemplate is not None:
+         try:
+            prompt_obj = PromptTemplate(template=text_template, input_variables=["chat_history", "context", "question"])
+            return prompt_obj.format(chat_history=chat_history, context=context, question=question)
+         except Exception:
+            pass
     try:
-        # Don't format empty chat history/context
-        chat_history = chat_history.strip() if chat_history else "(No previous conversation)"
-        context = context.strip() if context else "(No relevant data context found in database)"
-        question = question.strip()
-        # Use LangChain template if available
-        if PromptTemplate is not None:
-            try:
-                prompt_obj = PromptTemplate(template=text_template, input_variables=["chat_history", "context", "question"])
-                return prompt_obj.format(chat_history=chat_history, context=context, question=question)
-            except Exception:
-                pass
-        # Fallback: Use manual .format
         return text_template.format(chat_history=chat_history, context=context, question=question)
     except Exception:
         return f"Previous Conversation: {chat_history}\n\nContext: {context}\n\nCurrent Question: {question}\n\nAnswer:"
@@ -409,7 +417,6 @@ def send_to_llm(llm_obj, prompt_text: str) -> str:
     except Exception:
         traceback.print_exc()
     return ""
-
 
 # ---------------- Lifespan & app ----------------
 @asynccontextmanager
@@ -447,7 +454,7 @@ async def lifespan(app: FastAPI):
     # Create global memory object with proper configuration
     if ConversationBufferMemory is not None:
         ml_models["memory"] = ConversationBufferMemory(
-            memory_key="chat_history",
+            memory_key="chat_history", 
             return_messages=False,
             input_key="question",
             output_key="answer"
@@ -458,8 +465,8 @@ async def lifespan(app: FastAPI):
 
     if ml_models["local_llm"] is not None and vs is not None:
         ml_models["rag_chain"] = create_rag_chain(
-            ml_models["local_llm"],
-            vs,
+            ml_models["local_llm"], 
+            vs, 
             ml_models["memory"]
         )
 
@@ -500,7 +507,7 @@ def status():
             memory_content = memory_data.get("chat_history", "")
         except Exception:
             pass
-
+            
     return {
         "vector_store_ready": vs is not None,
         "vector_store_has_data": count > 0,
@@ -599,42 +606,67 @@ async def generate_text(req: QueryRequest):
     if local_llm is None:
         raise HTTPException(status_code=503, detail="No local LLM available.")
 
-    # ---------------- Always reload latest memory and retrieve relevant context ----------------
-    # 1. Get Latest Chat History (from memory object)
+    # Load chat history FIRST
     chat_history = ""
     if memory is not None:
         try:
             memory_data = memory.load_memory_variables({})
             chat_history = memory_data.get("chat_history", "")
+            print(f"[MEMORY] Loaded chat history: '{chat_history}'")
         except Exception as e:
             print(f"[MEMORY] Error loading memory: {e}")
 
-    # 2. Retrieve Relevant Document Context
+    # SMART CONTEXT RETRIEVAL LOGIC
     context_text = ""
     retrieved_docs = []
-    if vs is not None:
+
+    # Check if this is a conversational question about previous topics
+    conversational_keywords = [
+        "previous", "earlier", "before", "we were discussing", 
+        "last time", "what did we talk about", "what was the previous"
+    ]
+    
+    is_conversational_question = any(keyword in req.query.lower() for keyword in conversational_keywords)
+    
+    # Only retrieve context if:
+    # 1. Vector store is available
+    # 2. AND it's NOT a conversational question about previous topics
+    # 3. OR if there's no chat history yet
+    should_retrieve_context = (
+        vs is not None and 
+        (not is_conversational_question or not chat_history.strip())
+    )
+
+    if should_retrieve_context:
         try:
+            print(f"[LOGIC] Retrieving TOP_K={TOP_K} docs for query...")
             retriever = vs.as_retriever(search_kwargs={"k": TOP_K})
+            
             if hasattr(retriever, "get_relevant_documents"):
                 retrieved_docs = retriever.get_relevant_documents(req.query)
             elif hasattr(retriever, "retrieve"):
                 retrieved_docs = retriever.retrieve(req.query)
             else:
                 retrieved_docs = retriever(req.query) if callable(retriever) else []
+            
             if retrieved_docs:
                 context_text = "\n\n".join([getattr(d, "page_content", str(d)) for d in retrieved_docs])
+                print(f"[LOGIC] Found {len(retrieved_docs)} relevant docs.")
             else:
                 context_text = "(No relevant data context found in database)"
         except Exception as e:
             traceback.print_exc()
             context_text = "(Error during context retrieval)"
     else:
-        context_text = "(Vector store not available)"
+        if is_conversational_question:
+            print(f"[LOGIC] Skipping context retrieval - this is a conversational question about previous discussion")
+            context_text = "(Using conversation history instead of database context)"
+        else:
+            context_text = "(Vector store not available)"
 
-    # 3. Build Fresh Prompt *every turn*
+    # Build the final prompt with ALL information
     formatted_prompt = build_fallback_prompt(chat_history, context_text, req.query)
-
-    print(f"[PROMPT] Sending to LLM (first 250 chars): {formatted_prompt[:250]}...")
+    print(f"[PROMPT] Sending prompt to LLM (first 300 chars): {formatted_prompt[:300]}...")
 
     generated = send_to_llm(local_llm, formatted_prompt)
     if not generated:
@@ -642,18 +674,28 @@ async def generate_text(req: QueryRequest):
 
     # Clean up the response
     generated = generated.strip()
+    
+    # Remove common prefixes
     prefixes_to_remove = ["Response:", "Answer:", "Explanation:", "Summary:"]
     for prefix in prefixes_to_remove:
         if generated.lower().startswith(prefix.lower()):
             generated = generated[len(prefix):].strip()
             break
+    
+    # Remove any leading/trailing quotes
     generated = generated.strip('"\'')
+    
     print(f"[RESPONSE] Cleaned response: {generated}")
 
-    # 4. Save context to memory *after* generating the answer
+    # Save to memory
     if memory is not None:
         try:
             memory.save_context({"question": req.query}, {"answer": generated})
+            print(f"[MEMORY] Saved to memory - Question: '{req.query}', Answer: '{generated}'")
+            
+            # Verify it was saved
+            memory_data = memory.load_memory_variables({})
+            print(f"[MEMORY] Verification - Current history: '{memory_data.get('chat_history', '')}'")
         except Exception as e:
             print(f"[MEMORY] Error saving memory: {e}")
             traceback.print_exc()
