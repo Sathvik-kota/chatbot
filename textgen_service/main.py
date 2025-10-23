@@ -1,602 +1,186 @@
-"""
-Robust RAG service with LOCAL MODEL support - CHAT PROMPT VERSION
-Adds ChatPromptTemplate (with safe fallbacks) to the RAG prompt logic.
-"""
 import os
 import traceback
+from fastapi import FastAPI, HTTPException, Request
+from langchain.prompts import ChatPromptTemplate
+from langchain_community.vectorstores import Chroma
+from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain_community.llms import HuggingFaceHub
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
 import pandas as pd
-from typing import Optional
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form
-from pydantic import BaseModel
-from contextlib import asynccontextmanager
+import chromadb
+from chromadb.config import Settings
 
-# --- Try imports (be tolerant across environments) ---
-# ChatPromptTemplate: try a couple of possible import paths
-try:
-    from langchain.prompts import ChatPromptTemplate
-except Exception:
-    try:
-        from langchain.prompts.chat import ChatPromptTemplate
-    except Exception:
-        ChatPromptTemplate = None
+# Initialize FastAPI
+app = FastAPI(title="Cybersecurity RAG Service")
 
-try:
-    from langchain.prompts import PromptTemplate
-except Exception:
-    try:
-        from langchain_core.prompts import PromptTemplate
-    except Exception:
-        PromptTemplate = None
-
-try:
-    from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
-except Exception:
-    SentenceTransformerEmbeddings = None
-
-try:
-    from langchain_community.vectorstores import Chroma as LC_Chroma
-except Exception:
-    LC_Chroma = None
-
-try:
-    from langchain_huggingface import HuggingFacePipeline
-except Exception:
-    try:
-        from langchain_community.llms import HuggingFacePipeline
-    except Exception:
-        HuggingFacePipeline = None
-
-try:
-    from langchain.chains import RetrievalQA
-except Exception:
-    try:
-        from langchain_community.chains import RetrievalQA
-    except Exception:
-        RetrievalQA = None
-
-try:
-    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM, pipeline
-except Exception:
-    AutoTokenizer = None
-    AutoModelForSeq2SeqLM = None
-    AutoModelForCausalLM = None
-    pipeline = None
-
-# ---------------- Config ----------------
-ROOT_DIR = os.path.dirname(__file__) or os.getcwd()
-CHROMA_DB_PATH = os.path.join(ROOT_DIR, "chroma_db")
-DOCUMENTS_DIR = os.path.join(ROOT_DIR, "documents")
-HARDCODED_CSV_PATH = "/content/project/textgen_service/ai_cybersecurity_dataset-sampled-5k.csv"
-DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
-
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-
-# Use a SMALL local model that works well for Q&A
-LOCAL_MODEL_ID = "google/flan-t5-base"  # Using base for better quality
-
-TOP_K = 10  # *** INCREASED: Retrieve more documents for listing/aggregation queries ***
-
-# ---------------- Globals ----------------
+# ------------------ GLOBAL VARIABLES ------------------
 ml_models = {
     "embedding_function": None,
     "vector_store": None,
-    "local_llm": None,
-    "rag_chain": None,
+    "llm": None,
 }
+DB_DIR = "./chroma_db"
+DATA_FILE = "./data.csv"  # path to your CSV file
 
-# ---------------- Helpers ----------------
-def find_csv_path(basename: str = DEFAULT_CSV_BASENAME) -> Optional[str]:
-    candidates = [
-        HARDCODED_CSV_PATH,
-        os.path.join(DOCUMENTS_DIR, basename),
-        os.path.join(ROOT_DIR, basename),
-        os.path.join(os.getcwd(), basename),
-        basename
-    ]
-    for p in candidates:
-        if p and os.path.exists(p):
-            return p
-    return None
-
-def load_dataframe_from_csv(path: str) -> Optional[pd.DataFrame]:
-    try:
-        df = pd.read_csv(path)
-        df.columns = df.columns.str.strip()
-        print(f"[DATA] Loaded CSV: {path} rows={len(df)} cols={len(df.columns)}")
-        return df
-    except Exception:
-        traceback.print_exc()
-        return None
-
+# ------------------ SETUP FUNCTIONS ------------------
 def create_embedding_function():
-    if SentenceTransformerEmbeddings is None:
-        print("[EMB] SentenceTransformerEmbeddings not available.")
-        return None
-    try:
-        emb = SentenceTransformerEmbeddings(model_name=EMBEDDING_MODEL_NAME)
-        print("[EMB] Embedding initialized.")
-        return emb
-    except Exception:
-        traceback.print_exc()
-        return None
+    """Load sentence-transformer embeddings"""
+    print("🔹 Loading embedding model...")
+    return SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
 
-def init_chroma(embedding_function):
+def init_chroma(embedding_fn):
+    """Initialize or load Chroma vector store"""
+    print("🔹 Initializing Chroma DB...")
+    os.makedirs(DB_DIR, exist_ok=True)
+    client = chromadb.Client(Settings(persist_directory=DB_DIR))
     try:
-        os.makedirs(CHROMA_DB_PATH, exist_ok=True)
-    except Exception:
-        pass
-    if LC_Chroma is None:
-        print("[CHROMA] langchain_community.Chroma import not available.")
-        return None
-    try:
-        vs = LC_Chroma(persist_directory=CHROMA_DB_PATH, embedding_function=embedding_function)
-        print("[CHROMA] Initialized with persist_directory.")
-        return vs
-    except Exception:
-        traceback.print_exc()
-    try:
-        import chromadb
-        try:
-            client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-        except Exception:
-            client = chromadb.Client(path=CHROMA_DB_PATH) if hasattr(chromadb, "Client") else None
-        if client is not None:
-            vs = LC_Chroma(client=client, collection_name="rag_collection", embedding_function=embedding_function)
-            print("[CHROMA] Initialized with chromadb client.")
-            return vs
-    except Exception:
-        traceback.print_exc()
-    try:
-        vs = LC_Chroma(embedding_function=embedding_function)
-        print("[CHROMA] Initialized in-memory Chroma.")
-        return vs
-    except Exception:
-        traceback.print_exc()
-    return None
-
-def vs_count_estimate(vs) -> int:
-    if vs is None:
-        return 0
-    try:
-        col = getattr(vs, "_collection", None)
-        if col is not None and hasattr(col, "count"):
-            return int(col.count())
-    except Exception:
-        traceback.print_exc()
-    try:
-        if hasattr(vs, "get"):
-            res = vs.get()
-            if isinstance(res, dict):
-                docs = res.get("documents") or res.get("ids") or []
-                return int(len(docs))
-    except Exception:
-        traceback.print_exc()
-    return 0
-
-def _try_add_texts(vs, texts):
-    try:
-        if hasattr(vs, "add_texts"):
-            vs.add_texts(texts=texts)
-            return True, "add_texts"
-    except Exception:
-        traceback.print_exc()
-    try:
-        if hasattr(vs, "add_documents"):
-            docs = [{"page_content": t, "metadata": {}} for t in texts]
-            vs.add_documents(docs)
-            return True, "add_documents"
-    except Exception:
-        traceback.print_exc()
-    try:
-        col = getattr(vs, "_collection", None) or getattr(vs, "collection", None)
-        if col is not None and hasattr(col, "add"):
-            try:
-                col.add(documents=texts)
-            except TypeError:
-                col.add(documents=texts, metadatas=[{}]*len(texts), ids=[None]*len(texts))
-            return True, "_collection.add"
-    except Exception:
-        traceback.print_exc()
-    try:
-        for t in texts:
-            if hasattr(vs, "add_texts"):
-                vs.add_texts(texts=[t])
-        return True, "iterative_add_texts"
-    except Exception:
-        traceback.print_exc()
-    return False, None
-
-def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
-    """
-    Creates CLEAN, MEANINGFUL documents from ONLY the relevant columns
-    """
-    if df is None or vs is None:
-        return False, "no_df_or_vs"
-
-    # Use ONLY meaningful text columns
-    USEFUL_COLUMNS = [
-        "Attack Type",
-        "Attack Severity", 
-        "Threat Intelligence",
-        "Response Action"
-    ]
-    
-    df_cols_lower = {col.lower(): col for col in df.columns}
-    cols_to_use = [df_cols_lower[col_name.lower()] for col_name in USEFUL_COLUMNS if col_name.lower() in df_cols_lower]
-
-    if not cols_to_use:
-        print("[INGEST] ERROR: Could not find expected columns (Attack Type, Attack Severity, etc.)")
-        print(f"[INGEST] Available columns: {list(df.columns)}")
-        return False, "missing_expected_columns"
-    
-    print(f"[INGEST] Using text columns: {cols_to_use}")
-    
-    # Create clean, structured documents with labeled fields
-    def create_doc(row):
-        parts = []
-        for col in cols_to_use:
-            if pd.notna(row[col]) and str(row[col]).strip():
-                parts.append(f"{col}: {row[col]}")
-        return ". ".join(parts) if parts else ""
-    
-    docs = df.apply(create_doc, axis=1).tolist()
-    docs = [d for d in docs if d.strip()]
-    
-    if not docs:
-        print("[INGEST] ERROR: No documents were created from the DataFrame.")
-        return False, "no_documents_created"
-    
-    print(f"[INGEST] Created {len(docs)} clean documents")
-    print(f"[INGEST] Sample document: {docs[0][:200]}...")
-    
-    # Add documents in batches
-    total_added = 0
-    method = None
-    for i in range(0, len(docs), batch_docs):
-        batch = docs[i:i+batch_docs]
-        ok, method = _try_add_texts(vs, batch)
-        if not ok:
-            return False, f"batch_failed_at_{i}"
-        total_added += len(batch)
-    
-    try:
-        if hasattr(vs, "persist"):
-            vs.persist()
-    except Exception:
-        traceback.print_exc()
-    
-    return True, {"method": method, "docs_added": total_added}
-
-
-def create_local_llm():
-    """Create a local HuggingFace Pipeline model optimized for DETAILED answers"""
-    if HuggingFacePipeline is None:
-        print("[LLM] HuggingFacePipeline not available.")
-        return None
-    if pipeline is None or AutoTokenizer is None or AutoModelForSeq2SeqLM is None:
-        print("[LLM] transformers library not available.")
-        return None
-    
-    try:
-        print(f"[LLM] Loading local model: {LOCAL_MODEL_ID}")
-        
-        tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_ID)
-        
-        if "t5" in LOCAL_MODEL_ID.lower():
-            model = AutoModelForSeq2SeqLM.from_pretrained(LOCAL_MODEL_ID)
-            task = "text2text-generation"
-        else:
-            model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
-            task = "text-generation"
-        
-        # *** BALANCED SETTINGS FOR BOTH DETAILED AND LIST ANSWERS ***
-        pipe = pipeline(
-            task,
-            model=model,
-            tokenizer=tokenizer,
-            max_new_tokens=512,        # Allow long answers
-            min_length=40,             # Minimum reasonable length
-            temperature=0.3,           # *** BALANCED: Not too creative, not too rigid ***
-            do_sample=True,            # Enable for natural language
-            top_p=0.95,                # Allow more diversity for listing
-            top_k=50,                  # Moderate diversity
-            repetition_penalty=1.3,    # *** INCREASED: Prevent "DDoS DDoS DDoS" ***
-            no_repeat_ngram_size=3,    # Prevent 3-gram repetition
-            early_stopping=False       # Let it complete the answer
+        vs = Chroma(
+            collection_name="cyber_docs",
+            embedding_function=embedding_fn,
+            persist_directory=DB_DIR,
         )
-        
-        llm = HuggingFacePipeline(pipeline=pipe)
-        
-        print(f"[LLM] Local model loaded successfully: {LOCAL_MODEL_ID}")
+        print("✅ Chroma initialized")
+        return vs
+    except Exception as e:
+        print("❌ Chroma init failed:", e)
+        return None
+
+def load_llm():
+    """Load HuggingFace model"""
+    print("🔹 Loading LLM...")
+    try:
+        llm = HuggingFaceHub(
+            repo_id="google/flan-t5-base",
+            model_kwargs={"temperature": 0.3, "max_length": 512},
+        )
+        print("✅ LLM loaded successfully")
         return llm
-        
     except Exception as e:
-        print(f"[LLM] Failed to load local model: {e}")
-        traceback.print_exc()
+        print("❌ LLM loading failed:", e)
         return None
 
-def create_rag_chain(llm, vs):
-    """
-    Create RAG chain with prompt optimized for BOTH explanations AND listing
-    """
-    if llm is None or vs is None:
-        print("[RAG] Cannot create chain: llm or vs is None")
-        return None
-    
-    if RetrievalQA is None:
-        print("[RAG] RetrievalQA not available")
-        return None
-    
+def ingest_csv_to_chroma(vs, embedding_fn, file_path):
+    """Read CSV and ingest into Chroma"""
+    if not os.path.exists(file_path):
+        print("❌ CSV not found at", file_path)
+        return 0
+
+    print("📄 Reading CSV:", file_path)
+    df = pd.read_csv(file_path)
+    all_text = []
+
+    for col in df.columns:
+        df[col] = df[col].astype(str)
+    for i, row in df.iterrows():
+        text = " ".join(row.values)
+        all_text.append(text)
+
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    docs = [Document(page_content=t) for t in all_text]
+    split_docs = text_splitter.split_documents(docs)
+
+    print(f"🧩 Ingesting {len(split_docs)} chunks into Chroma...")
+    vs.add_documents(split_docs)
+    vs.persist()
+    print("✅ Ingestion complete.")
+    return len(split_docs)
+
+# ------------------ PROMPT TEMPLATE ------------------
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a cybersecurity expert. Use the given context to answer accurately, clearly, and concisely."),
+    ("human", "Context:\n{context}\n\nQuestion:\n{question}")
+])
+
+# ------------------ FASTAPI LIFESPAN ------------------
+@app.on_event("startup")
+async def startup_event():
+    """Initialize everything on startup"""
     try:
-        # *** CRITICAL: PROMPT THAT HANDLES BOTH LISTING AND EXPLANATION QUERIES ***
-        text_template = """You are a cybersecurity expert assistant. Answer the question based ONLY on the provided context from the database.
-
-Context from database:
-{context}
-
-Question: {question}
-
-Instructions:
-1. Carefully read ALL the context documents above
-2. If the question asks to "list" or "what are the types", extract ALL UNIQUE items mentioned across all context documents
-3. If the question asks to "explain" or "what is", provide a detailed 3-5 sentence explanation
-4. For listing questions: Create a clear list or enumeration of unique items found in the context
-5. For explanation questions: Provide comprehensive details with examples from the context
-6. NEVER repeat the same item multiple times
-7. If information is not in the context, say "I cannot find this information in the provided context."
-8. Do NOT use general knowledge - use ONLY what's in the context above
-
-Answer:"""
-
-        prompt_obj = None
-
-        # Prefer a chat-style prompt if available.
-        if ChatPromptTemplate is not None:
-            try:
-                # Attempt the simple from_messages style (works in many langchain versions)
-                chat_prompt = ChatPromptTemplate.from_messages([
-                    ("system", "You are a cybersecurity expert. Use the provided context to answer accurately and clearly. If info is missing, say you cannot find it in the context."),
-                    ("human", "Context: {context}\n\nQuestion: {question}")
-                ])
-                prompt_obj = chat_prompt
-                print("[RAG] Using ChatPromptTemplate for RAG.")
-            except Exception:
-                # If from_messages signature isn't supported, fall back to text template below
-                traceback.print_exc()
-                prompt_obj = None
-
-        # Fallback to old PromptTemplate if chat-style not available or failed
-        if prompt_obj is None and PromptTemplate is not None:
-            try:
-                prompt_obj = PromptTemplate(template=text_template, input_variables=["context", "question"])
-                print("[RAG] Using fallback PromptTemplate for RAG.")
-            except Exception:
-                traceback.print_exc()
-                prompt_obj = None
-
-        chain_type_kwargs = {}
-        if prompt_obj is not None:
-            chain_type_kwargs["prompt"] = prompt_obj
-
-        rag = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",
-            retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),  # Retrieve 10 docs
-            chain_type_kwargs=chain_type_kwargs,
-            return_source_documents=True
-        )
-        
-        print("[RAG] RAG chain created successfully with optimized prompt")
-        return rag
-        
+        embedding_fn = create_embedding_function()
+        ml_models["embedding_function"] = embedding_fn
+        vs = init_chroma(embedding_fn)
+        ml_models["vector_store"] = vs
+        llm = load_llm()
+        ml_models["llm"] = llm
     except Exception as e:
-        print(f"[RAG] Failed to create chain: {e}")
         traceback.print_exc()
-        return None
+        print("❌ Startup initialization failed:", e)
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    print("[LIFESPAN] starting up...")
-    
-    ml_models["embedding_function"] = create_embedding_function()
-    ml_models["vector_store"] = init_chroma(ml_models["embedding_function"])
-    vs = ml_models["vector_store"]
-    print(f"[LIFESPAN] vector_store object: {type(vs).__name__ if vs is not None else None}")
-
-    csv_path = find_csv_path()
-    if csv_path:
-        print(f"[LIFESPAN] Found CSV at: {csv_path}")
-    else:
-        print("[LIFESPAN] No sampled CSV found automatically.")
-
-    if vs is not None and csv_path:
-        try:
-            cnt = vs_count_estimate(vs)
-            print(f"[LIFESPAN] vector store estimated count: {cnt}")
-            if cnt == 0:
-                print("[LIFESPAN] Auto-ingesting CSV (may take time)...")
-                df = load_dataframe_from_csv(csv_path)
-                if df is not None and len(df) > 0:
-                    ok, info = ingest_dataframe(df, vs, batch_docs=500)
-                    print("[LIFESPAN] ingest result:", ok, info)
-        except Exception:
-            traceback.print_exc()
-    else:
-        print("[LIFESPAN] Skipping auto-ingest (no vs or no csv)")
-
-    print("[LIFESPAN] Loading local LLM (this may take a minute)...")
-    ml_models["local_llm"] = create_local_llm()
-    
-    if ml_models["local_llm"] is not None and vs is not None:
-        ml_models["rag_chain"] = create_rag_chain(ml_models["local_llm"], vs)
-    
-    print("[LIFESPAN] startup complete:", {
-        "vector_store_ready": vs is not None,
-        "vector_store_count": vs_count_estimate(vs) if vs is not None else 0,
-        "local_llm_ready": ml_models.get("local_llm") is not None,
-        "rag_chain_ready": ml_models.get("rag_chain") is not None,
-        "csv_found": bool(csv_path)
-    })
-    
-    yield
-    ml_models.clear()
-    print("[LIFESPAN] shutdown complete.")
-
-app = FastAPI(lifespan=lifespan)
-
-class QueryRequest(BaseModel):
-    query: str
-
-class QueryResponse(BaseModel):
-    answer: str
-
-@app.get("/")
-def root():
-    return {"status": "Text Generation (RAG) Service running with LOCAL models."}
+# ------------------ ROUTES ------------------
 
 @app.get("/status")
-def status():
+async def status():
     vs = ml_models.get("vector_store")
-    count = vs_count_estimate(vs) if vs is not None else 0
+    llm = ml_models.get("llm")
+    embed = ml_models.get("embedding_function")
+    count = 0
+    if vs:
+        try:
+            count = len(vs.get()["ids"])
+        except Exception:
+            count = 0
     return {
-        "vector_store_ready": vs is not None,
-        "vector_store_has_data": count > 0,
-        "vector_store_count": int(count),
-        "local_llm_ready": ml_models.get("local_llm") is not None,
-        "rag_chain_ready": ml_models.get("rag_chain") is not None,
-        "model_id": LOCAL_MODEL_ID,
-        "top_k": TOP_K,
-        "csv_found": bool(find_csv_path())
+        "vector_store_ready": bool(vs),
+        "vector_store_count": count,
+        "llm_ready": bool(llm),
+        "embedding_ready": bool(embed),
+        "model_id": "google/flan-t5-base",
+        "top_k": 6,
     }
 
-@app.post("/upload-csv")
-async def upload_csv(file: UploadFile = File(...), save_name: Optional[str] = Form(None)):
-    try:
-        os.makedirs(DOCUMENTS_DIR, exist_ok=True)
-        filename = save_name or file.filename or DEFAULT_CSV_BASENAME
-        dest = os.path.join(DOCUMENTS_DIR, filename)
-        contents = await file.read()
-        with open(dest, "wb") as f:
-            f.write(contents)
-        return {"status": "saved", "path": dest}
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Upload failed: {e}")
-
 @app.post("/force-ingest")
-def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
+async def force_ingest():
     vs = ml_models.get("vector_store")
-    if vs is None:
-        raise HTTPException(status_code=503, detail="Vector store not available.")
-    csv_path = find_csv_path()
-    if csv_path is None:
-        raise HTTPException(status_code=404, detail="CSV not found.")
-    df = load_dataframe_from_csv(csv_path)
-    if df is None or len(df) == 0:
-        raise HTTPException(status_code=400, detail="CSV empty or unreadable.")
-    if sample_limit is not None:
-        df = df.head(sample_limit)
-    
+    embedding_fn = ml_models.get("embedding_function")
+
+    if not vs or not embedding_fn:
+        raise HTTPException(status_code=503, detail="Vectorstore or embedding not ready")
+
     try:
-        print("[INGEST] Clearing old data from vector store...")
-        if hasattr(vs, "_collection"):
-            vs._collection.delete(ids=vs._collection.get()['ids'])
-            print("[INGEST] Old data cleared.")
-        else:
-            print("[INGEST] Could not automatically clear old data. Re-ingesting anyway.")
-    except Exception as e:
-        print(f"[INGEST] Error clearing old data: {e}. Continuing...")
-        traceback.print_exc()
-
-    ok, info = ingest_dataframe(df, vs, batch_docs=batch_size)
-    if not ok:
-        raise HTTPException(status_code=500, detail=f"Ingestion failed: {info}")
-    
-    final_count = vs_count_estimate(vs)
-    return {"status": "ingested", "method_info": info, "final_count": int(final_count)}
-
-@app.get("/get-csv-columns")
-def get_csv_columns():
-    csv_path = find_csv_path()
-    if csv_path is None:
-        raise HTTPException(status_code=404, detail="CSV not found.")
-    df = load_dataframe_from_csv(csv_path)
-    if df is None:
-        raise HTTPException(status_code=400, detail="CSV empty or unreadable.")
-    return {"columns": list(df.columns)}
-
-@app.post("/generate-text", response_model=QueryResponse)
-def generate_text(req: QueryRequest):
-    """
-    Generate answers using RAG - handles both listing and detailed explanation queries
-    """
-    if not req.query or not req.query.strip():
-        raise HTTPException(status_code=400, detail="Query cannot be empty.")
-    
-    rag = ml_models.get("rag_chain")
-
-    if rag is None:
-        raise HTTPException(status_code=503, detail="RAG chain not available. Model may still be loading.")
-    
-    try:
-        print("\n" + "="*80)
-        print(f"[QUERY] {req.query}")
-        print("="*80)
-        
-        out_text = None
-        source_docs = []
-        
-        if hasattr(rag, "invoke"):
-            res = rag.invoke({"query": req.query})
-            if isinstance(res, dict):
-                out_text = res.get("result")
-                source_docs = res.get("source_documents", [])
-            else:
-                out_text = str(res)
-        elif hasattr(rag, "__call__"):
-            res = rag({"query": req.query})
-            if isinstance(res, dict):
-                out_text = res.get("result")
-                source_docs = res.get("source_documents", [])
-            else:
-                out_text = str(res)
-        else:
-            raise HTTPException(status_code=500, detail="RAG chain invocation method not found")
-        
-        # Log retrieved context
-        if source_docs:
-            print(f"\n[CONTEXT] Retrieved {len(source_docs)} document(s):")
-            attack_types_in_context = set()
-            for i, doc in enumerate(source_docs):
-                print(f"\n  --- Document {i+1} ---")
-                print(f"  {doc.page_content[:300]}...")
-                if "Attack Type:" in doc.page_content:
-                    try:
-                        attack_type = doc.page_content.split("Attack Type:")[1].split(".")[0].strip()
-                        attack_types_in_context.add(attack_type)
-                    except:
-                        pass
-            
-            if attack_types_in_context:
-                print(f"\n[DEBUG] Unique attack types found in context: {attack_types_in_context}")
-        else:
-            print("\n[WARNING] No source documents were returned!")
-        
-        if out_text is None:
-            print("[ERROR] Failed to extract 'result' from RAG chain response.")
-            raise HTTPException(status_code=500, detail="Failed to get 'result' from RAG chain.")
-        
-        out_text = str(out_text).strip()
-        
-        print(f"\n[ANSWER] {out_text}")
-        print(f"[ANSWER LENGTH] {len(out_text.split())} words, {len(out_text.split('.'))} sentences")
-        print("="*80 + "\n")
-        
-        return QueryResponse(answer=out_text)
-
+        count = ingest_csv_to_chroma(vs, embedding_fn, DATA_FILE)
+        return {"status": "ok", "ingested_chunks": count}
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/generate-text")
+async def generate_text(request: Request):
+    data = await request.json()
+    query = data.get("query", "").strip()
+
+    if not query:
+        raise HTTPException(status_code=400, detail="Missing query")
+
+    llm = ml_models.get("llm")
+    vs = ml_models.get("vector_store")
+
+    if not llm or not ml_models.get("embedding_function"):
+        raise HTTPException(status_code=503, detail="LLM or embedding not ready")
+
+    # Retrieve context
+    context_text = ""
+    if vs:
+        retriever = vs.as_retriever(search_kwargs={"k": 6})
+        docs = retriever.invoke(query)
+        if docs:
+            context_text = "\n\n".join([d.page_content for d in docs])
+    else:
+        context_text = "No context available."
+
+    # Format prompt
+    formatted_prompt = prompt.format(context=context_text, question=query)
+
+    # Generate answer
+    try:
+        response = llm.invoke(formatted_prompt)
+    except Exception as e:
+        print("LLM generation error:", e)
+        raise HTTPException(status_code=500, detail=f"LLM error: {e}")
+
+    return {"answer": response}
+
+# ------------------ MAIN ENTRY ------------------
 if __name__ == "__main__":
-    print("Run: uvicorn main:app --host 0.0.0.0 --port 8002")
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8002)
