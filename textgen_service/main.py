@@ -2,6 +2,11 @@
 Robust RAG service with LOCAL MODEL support
 Uses PromptTemplate to format a single string input for T5 models.
 NOW WITH CONVERSATIONAL MEMORY.
+
+Key Updates:
+- TOP_K set to 4 as requested.
+- ingest_dataframe now formats CSV rows into natural language sentences
+  using the user-provided column list for better context.
 """
 import os
 import traceback
@@ -12,11 +17,6 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
 # --- Try imports (be tolerant across environments) ---
-# Per user instruction, T5 models expect a single string.
-# We will remove the ChatPromptTemplate logic and rely on PromptTemplate
-# to ensure a single string is always generated.
-ChatPromptTemplate = None
-
 try:
     from langchain.prompts import PromptTemplate
 except Exception:
@@ -76,7 +76,9 @@ DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 LOCAL_MODEL_ID = "google/flan-t5-base"
-TOP_K = 10
+
+# --- USER REQUEST: Set TOP_K to 4 ---
+TOP_K = 4
 
 # ---------------- Globals ----------------
 ml_models = {
@@ -90,14 +92,11 @@ ml_models = {
 }
 
 # ---------------- Chat prompt setup ----------------
-# We will not use ChatPromptTemplate as T5 models work best with
-# a single formatted string.
-chat_prompt_obj = None
-
-# This text_template will be our primary template, formatted as a single string.
-# NOW INCLUDES "chat_history"
+# This is the simplest, most direct prompt.
+# It relies on the LLM to be smart enough to use the right info.
+# The fix is in the *quality* of the context, which we fixed in ingest_dataframe.
 text_template = """You are a helpful cybersecurity expert assistant.
-Answer the 'Question' based on the 'Chat History' and 'Context from database' if relevant, or your own knowledge if not.
+Answer the user's 'Question' using your knowledge, the 'Chat History', and the 'Context from database'.
 
 Chat History:
 {chat_history}
@@ -242,25 +241,62 @@ def _try_add_texts(vs, texts: List[str]):
     return False, None
 
 def ingest_dataframe(df: pd.DataFrame, vs, batch_docs: int = 500):
+    """
+    --- UPDATED FUNCTION ---
+    Uses the user-provided column list to create natural language sentences
+    for embedding, instead of just raw key:value pairs.
+    """
     if df is None or vs is None:
         return False, "no_df_or_vs"
 
-    USEFUL_COLUMNS = ["Attack Type", "Attack Severity", "Threat Intelligence", "Response Action"]
+    # Use the text-heavy columns from the user's provided list
+    # We'll skip Event ID, Timestamp, IPs for the *semantic text*
+    USEFUL_COLUMNS = [
+        "Attack Type",
+        "Attack Severity",
+        "Data Exfiltrated",
+        "Threat Intelligence",
+        "Response Action",
+        "User Agent"
+    ]
+    
     df_cols_lower = {col.lower(): col for col in df.columns}
+    
+    # Find which of our desired columns are *actually* in the CSV
     cols_to_use = [df_cols_lower[c.lower()] for c in USEFUL_COLUMNS if c.lower() in df_cols_lower]
+    
     if not cols_to_use:
-        print("[INGEST] ERROR: Could not find expected columns.")
+        print("[INGEST] ERROR: Could not find expected text columns.")
         print(f"[INGEST] Available columns: {list(df.columns)}")
         return False, "missing_expected_columns"
 
-    print(f"[INGEST] Using text columns: {cols_to_use}")
+    print(f"[INGEST] Using text columns for embedding: {cols_to_use}")
 
     def create_doc(row):
-        parts = []
-        for col in cols_to_use:
-            if pd.notna(row[col]) and str(row[col]).strip():
-                parts.append(f"{col}: {row[col]}")
-        return ". ".join(parts) if parts else ""
+        # Create a natural language sentence from the row data
+        parts = ["A cybersecurity event was recorded"]
+        
+        # Add key info
+        if "Attack Type" in cols_to_use and pd.notna(row["Attack Type"]):
+            parts.append(f"Attack Type: {row['Attack Type']}")
+        if "Attack Severity" in cols_to_use and pd.notna(row["Attack Severity"]):
+            parts.append(f"Severity: {row['Attack Severity']}")
+        
+        # Add other details
+        if "Threat Intelligence" in cols_to_use and pd.notna(row["Threat Intelligence"]):
+            parts.append(f"Threat Intelligence: {row['Threat Intelligence']}")
+        if "Response Action" in cols_to_use and pd.notna(row["Response Action"]):
+            parts.append(f"Response: {row['Response Action']}")
+        if "Data Exfiltrated" in cols_to_use and pd.notna(row["Data Exfiltrated"]):
+            parts.append(f"Data Exfiltrated: {row['Data Exfiltrated']}")
+        if "User Agent" in cols_to_use and pd.notna(row["User Agent"]):
+             parts.append(f"User Agent: {row['User Agent']}")
+
+        # Join all parts with a comma, except the first one
+        if len(parts) > 1:
+            return parts[0] + ": " + ", ".join(parts[1:]) + "."
+        else:
+            return "" # Skip if no useful data
 
     docs = df.apply(create_doc, axis=1).tolist()
     docs = [d for d in docs if d.strip()]
@@ -345,7 +381,6 @@ def create_rag_chain(llm, vs, memory_obj=None):
         return None
     try:
         prompt_obj = None
-        # We exclusively use PromptTemplate, not ChatPromptTemplate
         
         if prompt_obj is None and PromptTemplate is not None:
             try:
@@ -363,12 +398,13 @@ def create_rag_chain(llm, vs, memory_obj=None):
         rag = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
+            # --- USER REQUEST: Use TOP_K (which is 4) ---
             retriever=vs.as_retriever(search_kwargs={"k": TOP_K}),
             chain_type_kwargs=chain_type_kwargs,
             return_source_documents=True,
             memory=memory_obj  # Pass the memory object here
         )
-        print("[RAG] RAG chain created successfully with prompt and memory")
+        print(f"[RAG] RAG chain created successfully with prompt, memory, and TOP_K={TOP_K}")
         return rag
     except Exception as e:
         print(f"[RAG] Failed to create chain: {e}")
@@ -376,7 +412,6 @@ def create_rag_chain(llm, vs, memory_obj=None):
         return None
 
 # Helper to format prompt when we need a plain string prompt (fallback)
-# This is now our *primary* manual formatting method
 def build_fallback_prompt(chat_history: str, context: str, question: str) -> str:
     if PromptTemplate is not None:
          try:
@@ -446,6 +481,7 @@ async def lifespan(app: FastAPI):
                 print("[LIFESPAN] Auto-ingesting CSV (may take time)...")
                 df = load_dataframe_from_csv(csv_path)
                 if df is not None and len(df) > 0:
+                    # --- Use new ingest function ---
                     ok, info = ingest_dataframe(df, vs, batch_docs=500)
                     print("[LIFESPAN] ingest result:", ok, info)
         except Exception:
@@ -511,7 +547,7 @@ def status():
         "rag_chain_ready": ml_models.get("rag_chain") is not None,
         "memory_ready": ml_models.get("memory") is not None,
         "model_id": LOCAL_MODEL_ID,
-        "top_k": TOP_K,
+        "top_k": TOP_K, # Report the new TOP_K
         "csv_found": bool(find_csv_path())
     }
 
@@ -553,6 +589,7 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
     except Exception:
         traceback.print_exc()
 
+    # --- Use new ingest function ---
     ok, info = ingest_dataframe(df, vs, batch_docs=batch_size)
     if not ok:
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {info}")
@@ -568,6 +605,7 @@ def get_csv_columns():
     df = load_dataframe_from_csv(csv_path)
     if df is None:
         raise HTTPException(status_code=400, detail="CSV empty or unreadable.")
+    # Return the exact columns from the file
     return {"columns": list(df.columns)}
 
 @app.post("/reset-memory")
@@ -621,15 +659,16 @@ async def generate_text(req: QueryRequest):
     context_text = ""
     if vs is not None:
         try:
+            # --- USER REQUEST: Use TOP_K (which is 4) ---
             retriever = vs.as_retriever(search_kwargs={"k": TOP_K})
-            # try common retriever methods
+            
             if hasattr(retriever, "get_relevant_documents"):
                 docs = retriever.get_relevant_documents(req.query)
             elif hasattr(retriever, "retrieve"):
                 docs = retriever.retrieve(req.query)
             else:
-                # fallback: call retriever as callable
                 docs = retriever(req.query) if callable(retriever) else []
+            
             if docs:
                 context_text = "\n\n".join([getattr(d, "page_content", str(d)) for d in docs])
         except Exception:
