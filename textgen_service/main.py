@@ -352,14 +352,14 @@ def create_local_llm():
             model=model,
             tokenizer=tokenizer,
             max_new_tokens=512,
-            min_length=40,
-            temperature=0.3,
+            # min_length=40, # --- REMOVED: This was likely forcing the garbage output ---
+            temperature=0.7, # --- ADJUSTED: Give it a bit more flexibility ---
             do_sample=True,
             top_p=0.95,
             top_k=50,
-            repetition_penalty=1.3,
-            no_repeat_ngram_size=3,
-            early_stopping=False
+            repetition_penalty=1.2, # --- ADJUSTED: Slightly lower ---
+            # no_repeat_ngram_size=3, # --- REMOVED: Rely on repetition_penalty ---
+            early_stopping=True     # --- ADDED: Allow model to stop when done ---
         )
 
         # Keep a direct hf pipeline as fallback too
@@ -727,4 +727,5 @@ async def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn main:app --host 0.0.0.0 --port 8002")
+
 
