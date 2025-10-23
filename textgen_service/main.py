@@ -1,6 +1,6 @@
 """
-RAG service with LangChain - FIXED VERSION WITH PROPER PROMPT HANDLING
-Uses LangChain but with clean, simple prompts that don't leak
+RAG service with LangChain - UPDATED TO USE ChatPromptTemplate
+Uses LangChain but with clean, simple chat-style prompt that won't leak
 """
 import os
 import traceback
@@ -11,6 +11,11 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
 # --- LangChain imports ---
+try:
+    from langchain.prompts import ChatPromptTemplate
+except:
+    ChatPromptTemplate = None
+
 try:
     from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
 except:
@@ -29,6 +34,7 @@ except:
     except:
         HuggingFacePipeline = None
 
+# Keep normal PromptTemplate fallback if ChatPromptTemplate isn't present
 try:
     from langchain.prompts import PromptTemplate
     from langchain_core.prompts import PromptTemplate as CorePromptTemplate
@@ -213,29 +219,40 @@ def create_local_llm():
         return None, None
 
 def create_langchain_rag(llm, vs):
-    """Create LangChain RAG chain with MINIMAL CLEAN PROMPT"""
+    """Create LangChain RAG chain with CHAT prompt (fallback to minimal text prompt)"""
     if not llm or not vs or not RetrievalQA:
         print("[RAG] Cannot create chain")
         return None
     
     try:
-        # *** CRITICAL: MINIMAL PROMPT THAT WON'T LEAK ***
-        # FLAN-T5 works best with simple, direct instructions
-        PromptClass = PromptTemplate or CorePromptTemplate
-        
-        if PromptClass:
-            # For database-specific questions
-            prompt = PromptClass(
-                template="Context: {context}\n\nQuestion: {question}\n\nAnswer:",
-                input_variables=["context", "question"]
-            )
-        else:
-            prompt = None
-        
+        prompt = None
+
+        # Prefer chat-style prompt if available
+        if ChatPromptTemplate:
+            try:
+                prompt = ChatPromptTemplate.from_messages([
+                    ("system", "You are a cybersecurity expert. Use the given context to answer accurately and clearly."),
+                    ("human", "Context: {context}\n\nQuestion: {question}")
+                ])
+                print("[RAG] Using ChatPromptTemplate")
+            except Exception:
+                prompt = None
+
+        # Fallback: simple PromptTemplate
+        if prompt is None:
+            PromptClass = PromptTemplate or CorePromptTemplate
+            if PromptClass:
+                prompt = PromptClass(
+                    template="Context: {context}\n\nQuestion: {question}\n\nAnswer:",
+                    input_variables=["context", "question"]
+                )
+                print("[RAG] Using fallback PromptTemplate")
+
         chain_type_kwargs = {}
         if prompt:
             chain_type_kwargs["prompt"] = prompt
-        
+
+        # Build RetrievalQA with the provided retriever and prompt
         rag = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
@@ -244,7 +261,7 @@ def create_langchain_rag(llm, vs):
             return_source_documents=True
         )
         
-        print("[RAG] LangChain RAG chain created with minimal prompt")
+        print("[RAG] LangChain RAG chain created with chat-style prompt (or fallback)")
         return rag
         
     except Exception as e:
@@ -405,6 +422,7 @@ def generate_text(req: QueryRequest):
         print(f"[DECISION] Database: {needs_database}, General: {is_general}")
         
         answer = None
+        prompt_text = None
         
         # PATH 1: Use LangChain RAG for database questions
         if needs_database and rag:
@@ -465,8 +483,8 @@ def generate_text(req: QueryRequest):
         answer = answer.strip()
         
         # Remove common prefixes that might have been echoed
-        for prefix in ["Answer:", "Context:", "Question:", prompt_text]:
-            if answer.startswith(prefix):
+        for prefix in ["Answer:", "Context:", "Question:", prompt_text or ""]:
+            if prefix and answer.startswith(prefix):
                 answer = answer[len(prefix):].strip()
         
         # Remove any remaining context echoes
