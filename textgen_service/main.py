@@ -4,13 +4,12 @@ Uses PromptTemplate to format a single string input for T5 models.
 NOW WITH CONVERSATIONAL MEMORY.
 
 Key Updates:
+- MODEL UPGRADE: Switched from flan-t5-base to flan-t5-large.
+  The 'base' model was not powerful enough to answer general questions
+  and was hallucinating. 'large' should fix this.
 - TOP_K set to 4 as requested.
 - ingest_dataframe now formats CSV rows into natural language sentences.
-- /generate-text endpoint now contains all-new conditional logic:
-  - It detects if a question is "general" (e.g., "what is...").
-  - If it's a general question, it FORCES context to be empty.
-  - If it's a data question, it retrieves and includes context.
-- This bypasses the simple RetrievalQA chain to fix the "context copying" bug.
+- /generate-text endpoint now contains all-new conditional logic.
 """
 import os
 import traceback
@@ -79,7 +78,9 @@ HARDCODED_CSV_PATH = "/content/project/textgen_service/ai_cybersecurity_dataset-
 DEFAULT_CSV_BASENAME = "ai_cybersecurity_dataset-sampled-5k.csv"
 
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
-LOCAL_MODEL_ID = "google/flan-t5-base"
+# --- MODEL UPGRADE ---
+# 'base' was not powerful enough. Using 'large' to get better general knowledge.
+LOCAL_MODEL_ID = "google/flan-t5-large"
 
 # --- USER REQUEST: Set TOP_K to 4 ---
 TOP_K = 4
