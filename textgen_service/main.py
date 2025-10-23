@@ -233,7 +233,7 @@ def _try_add_texts(vs, texts: List[str]):
                 col.add(documents=texts, metadatas=[{}]*len(texts), ids=ids)
             except Exception:
                  # Fallback if ids are not the issue
-                 col.add(documents=texts)
+                col.add(documents=texts)
             return True, "_collection.add"
     except Exception:
         traceback.print_exc()
@@ -422,10 +422,10 @@ def create_rag_chain(llm, vs, memory_obj=None):
 def build_fallback_prompt(chat_history: str, context: str, question: str) -> str:
     if PromptTemplate is not None:
          try:
-             prompt_obj = PromptTemplate(template=text_template, input_variables=["chat_history", "context", "question"])
-             return prompt_obj.format(chat_history=chat_history, context=context, question=question)
+            prompt_obj = PromptTemplate(template=text_template, input_variables=["chat_history", "context", "question"])
+            return prompt_obj.format(chat_history=chat_history, context=context, question=question)
          except Exception:
-             pass # Fall through to manual .format()
+            pass # Fall through to manual .format()
     try:
         # Fallback to direct string formatting
         return text_template.format(chat_history=chat_history, context=context, question=question)
@@ -504,9 +504,10 @@ async def lifespan(app: FastAPI):
         ml_models["memory"] = ConversationBufferMemory(
             memory_key="chat_history", 
             return_messages=False, # Return history as a string, best for T5
-            input_key="question" # Explicitly tell memory what the input key is
+            input_key="question", # Explicitly tell memory what the input key is
+            output_key="answer" # --- FIX: Explicitly tell memory the output key ---
         )
-        print("[LIFESPAN] Global ConversationBufferMemory created.")
+        print("[LIFESPAN] Global ConversationBufferMemory created with output_key='answer'.")
     else:
         print("[LIFESPAN] ConversationBufferMemory not available, chain will be stateless.")
 
@@ -590,12 +591,18 @@ def force_ingest(sample_limit: Optional[int] = None, batch_size: int = 500):
     try:
         print("[INGEST] Clearing old data from vector store...")
         if hasattr(vs, "_collection"):
-            vs._collection.delete(ids=vs._collection.get()['ids'])
-            print("[INGEST] Old data cleared.")
+            ids_to_delete = vs._collection.get()['ids']
+            if ids_to_delete:
+                vs._collection.delete(ids=ids_to_delete)
+                print("[INGEST] Old data cleared.")
+            else:
+                print("[INGEST] Collection was already empty.")
         else:
             print("[INGEST] Could not automatically clear old data. Re-ingesting anyway.")
     except Exception:
         traceback.print_exc()
+        print("[INGEST] Error clearing data, re-ingesting may result in duplicates.")
+
 
     # --- Use new ingest function ---
     ok, info = ingest_dataframe(df, vs, batch_docs=batch_size)
