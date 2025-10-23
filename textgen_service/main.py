@@ -1,13 +1,8 @@
 """
 Robust RAG service with LOCAL MODEL support
-Uses PromptTemplate to format a single string input for T5 models.
-NOW WITH CONVERSATIONAL MEMORY.
-
-Key Updates:
-- FIXED: Generation parameters for much more detailed answers
-- Enhanced prompt engineering to prevent short responses
-- Added explicit instructions for comprehensive answers
+FIXED: Proper memory handling and response formatting
 """
+
 import os
 import traceback
 import pandas as pd
@@ -16,7 +11,29 @@ from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Request
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 
-# --- Try imports (be tolerant across environments) ---
+# ... (keep all imports the same)
+
+# ---------------- Config ----------------
+ROOT_DIR = os.path.dirname(__file__) or os.getcwd()
+CHROMA_DB_PATH = os.path.join(ROOT_DIR, "chroma_db")
+DOCUMENTS_DIR = os.path.join(ROPASTED_CODE_HERE
+Let me provide the complete fixed code:
+
+```python
+"""
+Robust RAG service with LOCAL MODEL support
+FIXED: Memory system and response formatting
+"""
+
+import os
+import traceback
+import pandas as pd
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, Request
+from pydantic import BaseModel
+from contextlib import asynccontextmanager
+
+# Try imports (be tolerant across environments)
 try:
     from langchain.prompts import PromptTemplate
 except Exception:
@@ -88,21 +105,20 @@ ml_models = {
     "hf_pipeline": None
 }
 
-# ---------------- UPDATED PROMPT FOR DETAILED ANSWERS ----------------
-text_template = """You are a cybersecurity expert assistant. Provide comprehensive, detailed explanations.
+# ---------------- IMPROVED PROMPT WITH MEMORY AWARENESS ----------------
+text_template = """You are a cybersecurity expert assistant having a conversation with a user.
 
-Chat History:
+Previous Conversation:
 {chat_history}
 
 Context from database:
 {context}
 
-Question: {question}
+Current Question: {question}
 
-IMPORTANT: Provide a thorough, detailed answer. Explain concepts clearly and include relevant details.
-If the context contains relevant information, incorporate it. Otherwise, use your cybersecurity knowledge.
+Provide a helpful, detailed answer. If the question references previous conversation, make sure to acknowledge it and connect your answer to what was discussed before.
 
-Detailed Answer:"""
+Answer:"""
 
 # ---------------- Helpers ----------------
 def find_csv_path(basename: str = DEFAULT_CSV_BASENAME) -> Optional[str]:
@@ -318,22 +334,20 @@ def create_local_llm():
             model = AutoModelForCausalLM.from_pretrained(LOCAL_MODEL_ID)
             task = "text-generation"
 
-        # --- COMPREHENSIVE FIX: UPDATED GENERATION PARAMETERS ---
         pipe = pipeline(
             task,
             model=model,
             tokenizer=tokenizer,
-            max_new_tokens=350,  # Increased for more detailed answers
-            min_new_tokens=50,   # Force minimum length
+            max_new_tokens=300,
+            min_new_tokens=30,
             do_sample=True,
-            temperature=0.8,     # Higher temperature for more creative, detailed answers
-            top_k=50,            # Consider more tokens
-            top_p=0.92,          # Slightly higher for diversity
-            repetition_penalty=1.15,
-            early_stopping=False, # Don't stop early - let it generate fully
-            num_beams=4,         # Keep beam search for quality
-            length_penalty=1.2,  # Positive penalty to encourage longer sequences
-            no_repeat_ngram_size=3  # Avoid repeating 3-grams
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.1,
+            early_stopping=False,
+            num_beams=3,
+            length_penalty=1.0,
+            no_repeat_ngram_size=2
         )
 
         ml_models["hf_pipeline"] = pipe
@@ -398,7 +412,7 @@ def build_fallback_prompt(chat_history: str, context: str, question: str) -> str
     try:
         return text_template.format(chat_history=chat_history, context=context, question=question)
     except Exception:
-        return f"Chat History: {chat_history}\n\nContext: {context}\n\nQuestion: {question}\n\nDetailed Answer:"
+        return f"Previous Conversation: {chat_history}\n\nContext: {context}\n\nCurrent Question: {question}\n\nAnswer:"
 
 def send_to_llm(llm_obj, prompt_text: str) -> str:
     try:
@@ -457,6 +471,7 @@ async def lifespan(app: FastAPI):
     print("[LIFESPAN] Loading local LLM (this may take a minute)...")
     ml_models["local_llm"] = create_local_llm()
 
+    # Create global memory object with proper configuration
     if ConversationBufferMemory is not None:
         ml_models["memory"] = ConversationBufferMemory(
             memory_key="chat_history", 
@@ -464,7 +479,7 @@ async def lifespan(app: FastAPI):
             input_key="question",
             output_key="answer"
         )
-        print("[LIFESPAN] Global ConversationBufferMemory created with output_key='answer'.")
+        print("[LIFESPAN] Global ConversationBufferMemory created.")
     else:
         print("[LIFESPAN] ConversationBufferMemory not available, chain will be stateless.")
 
@@ -504,6 +519,15 @@ def root():
 def status():
     vs = ml_models.get("vector_store")
     count = vs_count_estimate(vs) if vs is not None else 0
+    memory = ml_models.get("memory")
+    memory_content = ""
+    if memory is not None:
+        try:
+            memory_data = memory.load_memory_variables({})
+            memory_content = memory_data.get("chat_history", "")
+        except Exception:
+            pass
+            
     return {
         "vector_store_ready": vs is not None,
         "vector_store_has_data": count > 0,
@@ -511,6 +535,7 @@ def status():
         "local_llm_ready": ml_models.get("local_llm") is not None,
         "rag_chain_ready": ml_models.get("rag_chain") is not None,
         "memory_ready": ml_models.get("memory") is not None,
+        "memory_content": memory_content[:200] + "..." if len(memory_content) > 200 else memory_content,
         "model_id": LOCAL_MODEL_ID,
         "top_k": TOP_K,
         "csv_found": bool(find_csv_path())
@@ -606,7 +631,7 @@ async def generate_text(req: QueryRequest):
 
     if vs is not None:
         try:
-            print(f"[LOGIC] Always retrieving TOP_K={TOP_K} docs for query...")
+            print(f"[LOGIC] Retrieving TOP_K={TOP_K} docs for query...")
             retriever = vs.as_retriever(search_kwargs={"k": TOP_K})
             
             if hasattr(retriever, "get_relevant_documents"):
@@ -627,28 +652,56 @@ async def generate_text(req: QueryRequest):
     else:
         context_text = "(Vector store not available)"
 
+    # Load and debug chat history
     chat_history = ""
     if memory is not None:
         try:
-            chat_history = memory.load_memory_variables({}).get("chat_history", "")
+            memory_data = memory.load_memory_variables({})
+            chat_history = memory_data.get("chat_history", "")
+            print(f"[MEMORY] Loaded chat history: '{chat_history}'")
         except Exception as e:
             print(f"[MEMORY] Error loading memory: {e}")
 
     formatted_prompt = build_fallback_prompt(chat_history, context_text, req.query)
-    print(f"[PROMPT] Sending prompt to LLM (first 200 chars): {formatted_prompt[:200]}...")
+    print(f"[PROMPT] Sending prompt to LLM (first 250 chars): {formatted_prompt[:250]}...")
 
     generated = send_to_llm(local_llm, formatted_prompt)
     if not generated:
         raise HTTPException(status_code=500, detail="LLM produced no output.")
 
+    # Clean up the response
+    generated = generated.strip()
+    
+    # Remove common prefixes
+    prefixes_to_remove = ["Response:", "Answer:", "Explanation:", "Summary:"]
+    for prefix in prefixes_to_remove:
+        if generated.lower().startswith(prefix.lower()):
+            generated = generated[len(prefix):].strip()
+            break
+    
+    # Remove any leading/trailing quotes
+    generated = generated.strip('"\'')
+    
+    print(f"[RESPONSE] Cleaned response: {generated}")
+
+    # Save to memory - use the exact format LangChain expects
     if memory is not None:
         try:
+            # Clear any existing temporary buffer
+            if hasattr(memory, 'clear'):
+                memory.clear()
+            
+            # Save the new conversation turn
             memory.save_context({"question": req.query}, {"answer": generated})
-            print("[MEMORY] Context saved to memory.")
+            print(f"[MEMORY] Saved to memory - Question: '{req.query}', Answer: '{generated}'")
+            
+            # Verify it was saved
+            memory_data = memory.load_memory_variables({})
+            print(f"[MEMORY] Verification - Current history: '{memory_data.get('chat_history', '')}'")
         except Exception as e:
             print(f"[MEMORY] Error saving memory: {e}")
+            traceback.print_exc()
 
-    generated = generated.strip()
     return QueryResponse(answer=generated)
 
 if __name__ == "__main__":
