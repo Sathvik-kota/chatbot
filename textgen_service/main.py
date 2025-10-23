@@ -353,12 +353,12 @@ def create_local_llm():
             tokenizer=tokenizer,
             max_new_tokens=512,
             
-            # --- MODIFIED: Back to sampling, but with 'min_new_tokens' ---
+            # --- MODIFIED: Removed 'min_new_tokens' ---
+            # This parameter was forcing the model to copy the database context
+            # instead of actually answering the question.
             do_sample=True,
-            temperature=0.6, # A bit more focused than the original 0.7
-            min_new_tokens=30, # --- ADDED: Force a more descriptive answer ---
-            # top_p=0.95,      # (Defaults are usually fine)
-            # top_k=50,        # (Defaults are usually fine)
+            temperature=0.7, # Raise temperature slightly to encourage fuller answers
+            # min_new_tokens=30, # <-- REMOVED
             
             repetition_penalty=1.2,
             early_stopping=True
@@ -721,6 +721,7 @@ async def generate_text(req: QueryRequest):
 
 if __name__ == "__main__":
     print("Run: uvicorn main:app --host 0.0.0.0 --port 8002")
+
 
 
 
