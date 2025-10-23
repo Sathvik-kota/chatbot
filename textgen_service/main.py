@@ -5,8 +5,10 @@ NOW WITH CONVERSATIONAL MEMORY.
 
 Key Updates:
 - TOP_K set to 4 as requested.
-- ingest_dataframe now formats CSV rows into natural language sentences
-  using the user-provided column list for better context.
+- ingest_dataframe now formats CSV rows into natural language sentences.
+- text_template is now *highly explicit* to force the model to
+  distinguish between general questions (use LLM knowledge) and
+  data questions (use RAG context).
 """
 import os
 import traceback
@@ -92,11 +94,19 @@ ml_models = {
 }
 
 # ---------------- Chat prompt setup ----------------
-# This is the simplest, most direct prompt.
-# It relies on the LLM to be smart enough to use the right info.
-# The fix is in the *quality* of the context, which we fixed in ingest_dataframe.
+# --- NEW, V_EXPLICIT PROMPT ---
+# This prompt is designed to force the T5 model to differentiate
+# between general knowledge questions and RAG/data questions.
 text_template = """You are a helpful cybersecurity expert assistant.
-Answer the user's 'Question' using your knowledge, the 'Chat History', and the 'Context from database'.
+Your job is to answer the user's 'Question'.
+
+You have two sources of information:
+1. Your own general knowledge.
+2. 'Context from database', which contains raw data logs (e.g., 'Attack Type: DDoS, Severity: High...').
+
+**Instructions:**
+- **For general questions** (like "What is a DDoS attack?", "Define vulnerability", "How does a SYN flood work?"), **IGNORE the 'Context from database'** and answer using your own general knowledge.
+- **For data-specific questions** (like "What attacks happened?", "List threat intelligence", "What was the response for the DDoS attack?"), use the 'Context from database' to find and present the answer.
 
 Chat History:
 {chat_history}
