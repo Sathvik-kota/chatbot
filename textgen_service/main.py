@@ -1,3 +1,4 @@
+%%writefile /content/project/textgen_service/main.py
 """
 CyberGuard AI - Conversational RAG Service
 This script implements the complete, stateful architecture for a conversational
@@ -26,7 +27,7 @@ try:
     from langchain_core.prompts import PromptTemplate
     from langchain.docstore.document import Document
 except ImportError as e:
-    print(f"Required libraries are missing: {e}. Please run 'pip install langchain langchain_community faiss-cpu sentence-transformers llama-cpp-python pandas fastapi uvicorn'")
+    print(f"Required libraries are missing: {e}. Please run 'pip install langchain langchain_community faiss-cpu sentence-transformers llama-cpp-python pandas fastapi uvicorn pyngrok'")
     exit(1)
 
 # --- Configuration ---
@@ -34,18 +35,16 @@ except ImportError as e:
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Paths and Model Settings ---
-# IMPORTANT: Update these paths to match your environment
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
 
-# Model path is set to a local 'models' folder
-MODEL_PATH = os.getenv("MODEL_PATH", "./models/mistral-7b-instruct-v0.2.Q4_K_M.gguf") 
+# [FIXED] Using the FULL, ABSOLUTE path to the model in Colab to prevent errors
+MODEL_PATH = os.getenv("MODEL_PATH", "/content/project/textgen_service/models/mistral-7b-instruct-v0.2.Q4_K_M.gguf") 
 
 VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", os.path.join(ROOT_DIR, "vectorstores/cyber_faiss"))
 CYBER_CSV_PATH = os.getenv("CYBER_CSV_PATH", "/content/project/textgen_service/ai_cybersecurity_dataset-sampled-5k.csv")
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 
 # --- Global In-Memory Stores ---
-# These dictionaries will hold the loaded models and active conversation chains.
 ml_models: Dict[str, Any] = {}
 
 # --- Data Ingestion Logic ---
@@ -68,7 +67,6 @@ def ingest_cybersecurity_csv(csv_path: str, vector_store_path: str, embedding_mo
         logging.error(f"FATAL: Failed to load or parse CSV file: {e}")
         raise
 
-    # Define which columns are most useful for creating document context
     USEFUL_COLUMNS = [
         "attack_type", "attack_severity", "data_exfiltrated", 
         "threat_intelligence", "response_action", "user_agent"
@@ -76,17 +74,14 @@ def ingest_cybersecurity_csv(csv_path: str, vector_store_path: str, embedding_mo
     
     documents: List[Document] = [] 
     for _, row in df.iterrows():
-        # Construct a descriptive sentence for each event. This creates better context for the RAG system.
         content_parts = ["A cybersecurity event was recorded."]
         for col in USEFUL_COLUMNS:
             if col in df.columns and pd.notna(row[col]):
-                # Format the column name back to a readable format for the LLM
                 col_name_readable = col.replace('_', ' ').title()
                 content_parts.append(f"{col_name_readable}: {row[col]}.")
         
         page_content = " ".join(content_parts)
         
-        # Create a LangChain Document object
         documents.append(Document(
             page_content=page_content,
             metadata={
@@ -102,7 +97,6 @@ def ingest_cybersecurity_csv(csv_path: str, vector_store_path: str, embedding_mo
 
     logging.info(f"Created {len(documents)} documents. Now creating vector store...")
     
-    # Create and save the FAISS vector store
     db = FAISS.from_documents(documents, embedding_model)
     os.makedirs(os.path.dirname(vector_store_path), exist_ok=True)
     db.save_local(vector_store_path)
@@ -110,41 +104,25 @@ def ingest_cybersecurity_csv(csv_path: str, vector_store_path: str, embedding_mo
     return db
 
 # --- Core Logic: Conversational Chain ---
-
-# This prompt is designed to rephrase a follow-up question into a standalone one,
-# which is crucial for accurate document retrieval.
 _template = """
 Given the following conversation and a follow-up question, rephrase the follow-up question to be a standalone question.
 The standalone question should be in the same language as the follow-up question.
-
-Chat History:
-{chat_history}
-
+Chat History: {chat_history}
 Follow Up Input: {question}
 Standalone question:"""
 CONDENSE_QUESTION_PROMPT = PromptTemplate.from_template(_template)
 
-# This prompt guides the LLM on how to answer. It's explicitly told to use the
-# retrieved context if available, but to fall back to its general knowledge if not.
-# This makes the chatbot versatile.
 qa_template = """
 You are "CyberGuard AI", a helpful and knowledgeable Cybersecurity Expert Assistant.
 Your goal is to provide accurate and helpful answers based on the information provided.
-
 Use the provided context from cybersecurity event logs to answer the question.
 If the context is empty or not relevant to the question, answer the question using your general knowledge.
-
 When answering, maintain a professional and helpful tone. If you don't know the answer, state that clearly.
-
-Context:
-{context}
-
-Chat History:
-{chat_history}
-
+Context: {context}
+Chat History: {chat_history}
 Question: {question}
 Helpful Answer:"""
-QA_PROMPT = PromptTemplate.from_template(qa_template)
+QA_PROMPT = PromptTemplate..from_template(qa_template)
 
 def create_conversational_chain(vector_store_retriever) -> ConversationalRetrievalChain:
     """
@@ -172,7 +150,6 @@ def create_conversational_chain(vector_store_retriever) -> ConversationalRetriev
     return chain
 
 # --- FastAPI Application Lifespan (Startup and Shutdown) ---
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
@@ -180,8 +157,6 @@ async def lifespan(app: FastAPI):
     """
     logging.info("Application startup sequence initiated...")
     
-    # This dictionary will store active conversation chains, mapped by session_id.
-    # This is the core of our application's state management.
     ml_models["conversation_chains"] = {}
     
     try:
@@ -189,7 +164,7 @@ async def lifespan(app: FastAPI):
         logging.info(f"Loading embedding model: {EMBEDDING_MODEL_NAME}")
         ml_models["embeddings"] = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL_NAME,
-            model_kwargs={'device': 'cpu'} # Change to 'cuda' for GPU
+            model_kwargs={'device': 'cpu'} # Embeddings on CPU is fine
         )
 
         # 2. Load or Create Vector Store
@@ -212,17 +187,22 @@ async def lifespan(app: FastAPI):
         logging.info(f"Loading LLM from: {MODEL_PATH}")
         if not os.path.exists(MODEL_PATH):
              raise FileNotFoundError(f"LLM model not found at {MODEL_PATH}. Please download the model file.")
+        
+        # Load LLM with GPU support (n_gpu_layers=-1 means all layers on GPU)
         ml_models["llm"] = LlamaCpp(
             model_path=MODEL_PATH,
-            n_gpu_layers=-1, n_batch=512, n_ctx=4096, f16_kv=True, verbose=False
+            n_gpu_layers=-1,  # <-- THIS ENABLES THE GPU
+            n_batch=512, 
+            n_ctx=4096, 
+            f16_kv=True, 
+            verbose=False
         )
         
-        logging.info("--- CyberGuard AI is online and ready. ---")
+        logging.info("--- CyberGuard AI is online and ready (with GPU). ---")
     
     except Exception as e:
         logging.error(f"FATAL ERROR during startup: {e}")
         logging.error(traceback.format_exc())
-        # The application cannot run without its core components.
         exit(1)
 
     yield # The application is now running
@@ -234,7 +214,6 @@ async def lifespan(app: FastAPI):
 
 
 # --- FastAPI Application and Endpoints ---
-
 app = FastAPI(
     title="CyberGuard AI - Conversational RAG Service",
     description="A stateful chatbot for cybersecurity and general knowledge questions.",
@@ -258,7 +237,7 @@ def root():
 def status():
     return {
         "llm_loaded": ml_models.get("llm") is not None,
-        "vector_store_loaded": ml_models.get("vector_store") is not None,
+        "vector_store_loaded": ml_models.get("vector_store") in ml_models,
         "active_conversations": len(ml_models.get("conversation_chains", {})),
     }
 
@@ -274,7 +253,6 @@ async def chat(request: ChatRequest):
 
     conversation_chains = ml_models["conversation_chains"]
     
-    # Get or create the conversational chain for the given session_id
     if request.session_id not in conversation_chains:
         logging.info(f"Creating new conversation chain for session_id: {request.session_id}")
         retriever = ml_models["vector_store"].as_retriever(search_kwargs={"k": 3})
@@ -283,11 +261,9 @@ async def chat(request: ChatRequest):
     qa_chain = conversation_chains[request.session_id]
 
     try:
-        # Asynchronously invoke the chain to get the answer
         result = await qa_chain.ainvoke({"question": request.question})
         
-        # Format source documents for a clean API response
-        sources = [] # Initialize empty list
+        sources = [] 
         if result.get("source_documents"):
             for doc in result["source_documents"]:
                 sources.append({
@@ -319,9 +295,6 @@ async def reset(session_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    # To run this script:
-    # 1. Make sure you have a GGUF model file at the location specified in MODEL_PATH.
-    # 2. Make sure your cybersecurity CSV is at the location specified in CYBER_CSV_PATH.
-    # 3. Run from your terminal: uvicorn main:app --host 0.0.0.0 --port 8002
+    # This part is for running from command line, but we will run it differently in Colab
     uvicorn.run(app, host="0.0.0.0", port=8002)
 
