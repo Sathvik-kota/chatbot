@@ -19,3 +19,4 @@ langchain-openai
 openai
 faiss-cpu
 llama-cpp-python
+huggingface_hub

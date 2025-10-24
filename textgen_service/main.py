@@ -15,7 +15,7 @@ from typing import Dict, List, Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
-
+from huggingface_hub import hf_hub_download
 # --- LangChain and Model Imports ---
 try:
     from langchain_community.llms import LlamaCpp
@@ -37,7 +37,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
 
 # [FIXED] Using the FULL, ABSOLUTE path to the model in Colab to prevent errors
-MODEL_PATH = os.getenv("MODEL_PATH", "/content/drive/MyDrive/models/mistral-7b-instruct-v0.2.Q4_K_M.gguf") 
+MODEL_PATH = hf_hub_download(repo_id="Sathvik-kota/mistral", filename="mistral-7b-instruct-v0.2.Q4_K_M.gguf", repo_type="model")
 
 VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", os.path.join(ROOT_DIR, "vectorstores/cyber_faiss"))
 CYBER_CSV_PATH = os.getenv("CYBER_CSV_PATH", "/content/project/textgen_service/ai_cybersecurity_dataset-sampled-5k.csv")
