@@ -170,7 +170,7 @@ if feature == "Chat with MicroChaTBoT":
                     }
                     
                     # Increased timeout for slow LlamaCpp model
-                    resp = requests.post(api_url, json=payload, timeout=180) 
+                    resp = requests.post(api_url, json=payload, timeout=400) 
                 
                 if resp.status_code == 200:
                     # --- [FIX] UPDATED RESPONSE HANDLING ---
