@@ -36,7 +36,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- Paths and Model Settings ---
 # IMPORTANT: Update these paths to match your environment
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
-MODEL_PATH = os.getenv("MODEL_PATH", "/home/user/my-models/mistral-7b-instruct-v0.2.Q4_K_M.gguf")
+# --- Make sure this path is correct for your system ---
+MODEL_PATH = os.getenv("MODEL_PATH", "/home/user/my-models/mistral-7b-instruct-v0.2.Q4_K_M.gguf") 
 VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", os.path.join(ROOT_DIR, "vectorstores/cyber_faiss"))
 CYBER_CSV_PATH = os.getenv("CYBER_CSV_PATH", "/content/project/textgen_service/ai_cybersecurity_dataset-sampled-5k.csv")
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
@@ -71,7 +72,6 @@ def ingest_cybersecurity_csv(csv_path: str, vector_store_path: str, embedding_mo
         "threat_intelligence", "response_action", "user_agent"
     ]
     
-    # --- [FIXED] Initialize documents as an empty list ---
     documents: List[Document] = [] 
     for _, row in df.iterrows():
         # Construct a descriptive sentence for each event. This creates better context for the RAG system.
@@ -150,9 +150,12 @@ def create_conversational_chain(vector_store_retriever) -> ConversationalRetriev
     """
     logging.info("Creating a new conversational chain instance.")
     
+    # --- [FIXED] Added input_key and output_key to correctly wire the memory ---
     memory = ConversationBufferMemory(
         memory_key="chat_history",
-        return_messages=True
+        return_messages=True,
+        input_key="question",    # Tells memory the human's input is in the "question" key
+        output_key="answer"      # Tells memory the AI's output is in the "answer" key
     )
 
     chain = ConversationalRetrievalChain.from_llm(
@@ -243,15 +246,12 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
-    # --- [FIXED] Corrected the type hint from List] to List[dict] ---
     source_documents: List[dict]
 
-# --- [FIXED] Added list values to tags ---
 @app.get("/", tags=["Root"])
 def root():
     return {"status": "CyberGuard AI is running."}
 
-# --- [FIXED] Added list values to tags ---
 @app.get("/status", tags=["Status"])
 def status():
     return {
@@ -282,6 +282,7 @@ async def chat(request: ChatRequest):
 
     try:
         # Asynchronously invoke the chain to get the answer
+        # This call is correct: {"question": ...}
         result = await qa_chain.ainvoke({"question": request.question})
         
         # Format source documents for a clean API response
@@ -301,7 +302,8 @@ async def chat(request: ChatRequest):
     except Exception as e:
         logging.error(f"Error during chain invocation for session {request.session_id}: {e}")
         logging.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail="Internal server error during model processing.")
+        # The error message 'e' will now be correct
+        raise HTTPException(status_code=500, detail=f"Error during chain invocation: {e}")
 
 @app.post("/reset", tags=["Conversation"])
 async def reset(session_id: str):
@@ -313,7 +315,7 @@ async def reset(session_id: str):
         logging.info(f"Conversation history for session_id '{session_id}' has been reset.")
         return {"message": f"Conversation for session '{session_id}' reset successfully."}
     else:
-        raise HTTPException(status_code=4.04, detail=f"Session '{session_id}' not found.")
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
 
 if __name__ == "__main__":
     import uvicorn
