@@ -36,8 +36,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # --- Paths and Model Settings ---
 # IMPORTANT: Update these paths to match your environment
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__)) if '__file__' in locals() else os.getcwd()
-# --- Make sure this path is correct for your system ---
-MODEL_PATH = os.getenv("MODEL_PATH", "/home/user/my-models/mistral-7b-instruct-v0.2.Q4_K_M.gguf") 
+
+# Model path is set to a local 'models' folder
+MODEL_PATH = os.getenv("MODEL_PATH", "./models/mistral-7b-instruct-v0.2.Q4_K_M.gguf") 
+
 VECTOR_STORE_PATH = os.getenv("VECTOR_STORE_PATH", os.path.join(ROOT_DIR, "vectorstores/cyber_faiss"))
 CYBER_CSV_PATH = os.getenv("CYBER_CSV_PATH", "/content/project/textgen_service/ai_cybersecurity_dataset-sampled-5k.csv")
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
@@ -150,7 +152,7 @@ def create_conversational_chain(vector_store_retriever) -> ConversationalRetriev
     """
     logging.info("Creating a new conversational chain instance.")
     
-    # --- [FIXED] Added input_key and output_key to correctly wire the memory ---
+    # Correctly configured memory
     memory = ConversationBufferMemory(
         memory_key="chat_history",
         return_messages=True,
@@ -282,7 +284,6 @@ async def chat(request: ChatRequest):
 
     try:
         # Asynchronously invoke the chain to get the answer
-        # This call is correct: {"question": ...}
         result = await qa_chain.ainvoke({"question": request.question})
         
         # Format source documents for a clean API response
@@ -302,7 +303,6 @@ async def chat(request: ChatRequest):
     except Exception as e:
         logging.error(f"Error during chain invocation for session {request.session_id}: {e}")
         logging.error(traceback.format_exc())
-        # The error message 'e' will now be correct
         raise HTTPException(status_code=500, detail=f"Error during chain invocation: {e}")
 
 @app.post("/reset", tags=["Conversation"])
@@ -322,6 +322,6 @@ if __name__ == "__main__":
     # To run this script:
     # 1. Make sure you have a GGUF model file at the location specified in MODEL_PATH.
     # 2. Make sure your cybersecurity CSV is at the location specified in CYBER_CSV_PATH.
-    # 3. Run from your terminal: uvicorn your_script_name:app --host 0.0.0.0 --port 8000
+    # 3. Run from your terminal: uvicorn main:app --host 0.0.0.0 --port 8002
     uvicorn.run(app, host="0.0.0.0", port=8002)
 
