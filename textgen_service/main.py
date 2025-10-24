@@ -1,4 +1,3 @@
-
 """
 CyberGuard AI - Conversational RAG Service
 This script implements the complete, stateful architecture for a conversational
@@ -95,7 +94,7 @@ def ingest_cybersecurity_csv(csv_path: str, vector_store_path: str, embedding_mo
         logging.error("FATAL: No documents were created from the CSV. Check the CSV content and column names.")
         raise ValueError("No documents to ingest.")
 
-    logging.info(f"Created {len(documents)} documents. Now creating vector store..._")
+    logging.info(f"Created {len(documents)} documents. Now creating vector store...")
     
     db = FAISS.from_documents(documents, embedding_model)
     os.makedirs(os.path.dirname(vector_store_path), exist_ok=True)
@@ -291,7 +290,7 @@ async def reset(session_id: str):
         logging.info(f"Conversation history for session_id '{session_id}' has been reset.")
         return {"message": f"Conversation for session '{session_id}' reset successfully."}
     else:
-        raise HTTPException(status_code=444, detail=f"Session '{session_id}' not found.")
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
 
 if __name__ == "__main__":
     import uvicorn
