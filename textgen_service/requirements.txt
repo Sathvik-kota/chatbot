@@ -18,3 +18,4 @@ python-dotenv==1.0.1
 langchain-openai
 openai
 faiss-cpu
+llama-cpp-python
